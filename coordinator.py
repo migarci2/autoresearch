@@ -408,9 +408,11 @@ class Coordinator:
             branch = _git_branch()
             commit = _git_commit_short()
 
-            # Get current global best for delta calculation
+            # Get current global best and personal best for delta calculations
             global_best_bpb = self._get_global_best_bpb()
             delta_vs_best = val_bpb - global_best_bpb if global_best_bpb is not None else None
+            agent_best_bpb = self._get_agent_best_bpb()
+            delta_vs_own_best = val_bpb - agent_best_bpb if agent_best_bpb is not None else None
 
             result_data = {
                 "agent_id": self.agent_id or "unknown",
@@ -426,6 +428,8 @@ class Coordinator:
                 "completed_at": _now_iso(),
                 "delta_vs_best": delta_vs_best,
                 "global_best_at_publish": global_best_bpb,
+                "delta_vs_own_best": delta_vs_own_best,
+                "agent_best_at_publish": agent_best_bpb,
                 **(extra_metrics or {}),
             }
 
@@ -453,8 +457,9 @@ class Coordinator:
                 delta_str = f" (delta={delta_vs_best:+.4f} vs global best {global_best_bpb:.6f})"
             self._log(f"RESULT: val_bpb={val_bpb:.6f}{delta_str} ({status})")
 
-            # Update global best if this is an improvement
+            # Update bests if this is a keep
             if status == "keep":
+                self._update_agent_best(val_bpb, result_data)
                 self.maybe_update_best(val_bpb, result_data, train_py_source)
 
         except Exception as e:
@@ -472,6 +477,92 @@ class Coordinator:
         except Exception:
             pass
         return None
+
+    def _get_agent_best_bpb(self, agent_id: str = None) -> Optional[float]:
+        """Read an agent's personal best val_bpb. Returns None if unavailable."""
+        agent = agent_id or self.agent_id or "unknown"
+        try:
+            key = f"@{HUB_ORG}/best/agent/{agent}"
+            result = self._rpc("get_memory", {"key_names": [key]})
+            results = result.get("results", [])
+            if results and results[0].get("status") == "success":
+                data = json.loads(results[0].get("value", "{}"))
+                return data.get("val_bpb")
+        except Exception:
+            pass
+        return None
+
+    def _update_agent_best(self, val_bpb: float, result_data: dict) -> None:
+        """Update this agent's personal best if this result beats it."""
+        agent = self.agent_id or "unknown"
+        try:
+            key = f"@{HUB_ORG}/best/agent/{agent}"
+            current = self._get_agent_best_bpb()
+
+            if current is not None and val_bpb >= current:
+                return  # not better
+
+            best_data = {
+                "agent_id": agent,
+                "val_bpb": val_bpb,
+                "description": result_data.get("description"),
+                "memory_gb": result_data.get("memory_gb"),
+                "achieved_at": _now_iso(),
+                "previous_best_val_bpb": current,
+            }
+            value_b64 = base64.b64encode(json.dumps(best_data).encode()).decode()
+            try:
+                self._rpc("update_memory", {
+                    "key_name": key,
+                    "value": value_b64,
+                    "base64": True,
+                })
+            except Exception:
+                self._rpc("create_memory", {"items": [{
+                    "key_name": key,
+                    "description": f"[autoresearch] Personal best for {agent}: val_bpb={val_bpb:.6f}",
+                    "value": value_b64,
+                    "base64": True,
+                }]})
+
+            improvement = (current - val_bpb) if current else 0
+            self._log(f"New personal best! val_bpb={val_bpb:.6f} (improved {improvement:.4f})")
+
+        except Exception as e:
+            self._log(f"_update_agent_best error: {e}")
+
+    def get_all_agent_bests(self) -> list[dict]:
+        """Get every agent's personal best. Useful for seeing which strategies work across different hardware."""
+        try:
+            result = self._rpc("list_keys", {
+                "prefix": f"@{HUB_ORG}/best/agent/",
+                "limit": 50,
+            })
+            keys = result.get("keys", [])
+            key_names = []
+            for k in keys:
+                name = k.get("key_name", k) if isinstance(k, dict) else k
+                key_names.append(f"@{HUB_ORG}/{name}")
+
+            if not key_names:
+                return []
+
+            bests = []
+            for kn in key_names:
+                try:
+                    r = self._rpc("get_memory", {"key_names": [kn]})
+                    results = r.get("results", [])
+                    if results and results[0].get("status") == "success":
+                        data = json.loads(results[0].get("value", "{}"))
+                        bests.append(data)
+                except Exception:
+                    pass
+
+            return sorted(bests, key=lambda x: x.get("val_bpb", float("inf")))
+
+        except Exception as e:
+            self._log(f"get_all_agent_bests error: {e}")
+            return []
 
     def maybe_update_best(
         self,
@@ -805,6 +896,16 @@ class Coordinator:
             for h in unclaimed[:3]:
                 lines.append(f"  {h.get('title', '?')} (priority={h.get('priority', '?')})")
 
+            # Per-agent bests
+            agent_bests = self.get_all_agent_bests()
+
+            lines.append(f"\nAgent personal bests ({len(agent_bests)}):")
+            lines.append("  (improvements relative to each agent's own hardware/baseline)")
+            for ab in agent_bests:
+                prev = ab.get("previous_best_val_bpb")
+                improvement = f" (improved {prev - ab['val_bpb']:.4f} from {prev:.6f})" if prev else ""
+                lines.append(f"  [{ab.get('agent_id', '?')}] val_bpb={ab.get('val_bpb', 0):.6f}{improvement} — {ab.get('description', '?')}")
+
             lines.append(f"\nTrend: {trend}")
             lines.append("=" * 50)
 
@@ -814,6 +915,7 @@ class Coordinator:
                 "recent_failures": recent_failures,
                 "active_claims": active_claims,
                 "unclaimed_hypotheses": unclaimed,
+                "agent_bests": agent_bests,
                 "improvement_trend": trend,
                 "summary": "\n".join(lines),
             }
@@ -822,7 +924,7 @@ class Coordinator:
             self._log(f"analyze_swarm error: {e}")
             return {
                 "global_best": None, "recent_keeps": [], "recent_failures": [],
-                "active_claims": [], "unclaimed_hypotheses": [],
+                "active_claims": [], "unclaimed_hypotheses": [], "agent_bests": [],
                 "improvement_trend": "unknown", "summary": f"Error: {e}",
             }
 

@@ -57,6 +57,16 @@ The `best/` namespace holds the current global best train.py and its metadata. A
 
 If you suspect the global best has been corrupted, the previous best info is always in the metadata. The full history is also in `results/` — you can find the real best by scanning all kept results.
 
+## Per-agent bests
+
+Not every agent has the same hardware. An agent on a 4090 will have a worse absolute val_bpb than one on an H200 — but their *relative improvements* are just as valuable. If an agent finds that SwiGLU improves their val_bpb by 0.003, that's a finding worth sharing even if their absolute number is worse than the global best.
+
+The coordinator tracks each agent's personal best under `best/agent/<name>`. When you `analyze_swarm()`, you'll see every agent's trajectory — not just the global winner. This tells you which *strategies* are working, regardless of hardware differences.
+
+`coord.get_all_agent_bests()` returns every agent's personal best sorted by val_bpb. Use this in the THINK phase to spot strategies that improved results across different hardware — those are likely transferable insights.
+
+**Your keeps matter even if they don't beat the global best.** If you improved from your own baseline, publish an insight about *why* it worked. That reasoning helps agents on faster hardware who can try the same strategy from a better starting point.
+
 ## The loop
 
 The experiment loop is defined in `program.md`. In collaborative mode, steps 1 (THINK), 2 (CLAIM), and 10 (PUBLISH) are **not optional** — they are core parts of the loop. The details below expand on what each step requires:
