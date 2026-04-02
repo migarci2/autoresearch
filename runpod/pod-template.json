@@ -1,0 +1,30 @@
+{
+  "name": "autoresearch-mnist-swarm",
+  "imageName": "ghcr.io/REPLACE_ME/autoresearch-mnist:main",
+  "gpuCount": 1,
+  "gpuTypeIds": [
+    "NVIDIA GeForce RTX 3090"
+  ],
+  "gpuTypePriority": "availability",
+  "containerDiskInGb": 50,
+  "networkVolumeId": "REPLACE_WITH_NETWORK_VOLUME_ID",
+  "volumeMountPath": "/workspace",
+  "ports": [
+    "22/tcp",
+    "8080/http"
+  ],
+  "supportPublicIp": true,
+  "interruptible": false,
+  "env": {
+    "RUNPOD_MODE": "1",
+    "RUNPOD_AUTO_BOOTSTRAP": "1",
+    "RUNPOD_WORKSPACE_DIR": "/workspace",
+    "RUNPOD_APP_DIR": "/workspace/autoresearch",
+    "SWARM_CONFIG_PATH": "/workspace/autoresearch/config/swarm.yaml",
+    "SWARM_VAULT_PASSPHRASE_FILE": "/workspace/autoresearch/secrets/runpod-vault.passphrase",
+    "SSH_PUBLIC_KEY": "ssh-ed25519 REPLACE_ME",
+    "AUTORESEARCH_IMAGE_REVISION": "main"
+  },
+  "dockerEntrypoint": [],
+  "dockerStartCmd": []
+}

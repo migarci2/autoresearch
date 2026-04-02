@@ -1,630 +1,970 @@
 """
-Autoresearch pretraining script. Single-GPU, single-file.
-Cherry-picked and simplified from nanochat.
-Usage: uv run train.py
+MNIST autoresearch driver.
+
+The agent-facing surface lives in the editable config sections below:
+  - RUN_MODE
+  - MODEL_CFG
+  - AUGMENT_CFG
+  - OPTIM_CFG
+  - ENSEMBLE_CFG
 """
 
-import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+from __future__ import annotations
 
-import gc
+import contextlib
+import hashlib
+import json
 import math
+import os
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
-
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+from coordinator import Coordinator
+from prepare import NUM_CLASSES, cycle, evaluate_model, make_dataloaders, save_logits_artifact
 
 # ---------------------------------------------------------------------------
-# GPT Model
+# Editable config surface
 # ---------------------------------------------------------------------------
 
-@dataclass
-class GPTConfig:
-    sequence_len: int = 2048
-    vocab_size: int = 32768
-    n_layer: int = 12
-    n_head: int = 6
-    n_kv_head: int = 6
-    n_embd: int = 768
-    window_pattern: str = "SSSL"
+SEARCH_TIME_BUDGET = 45
+FINAL_TIME_BUDGET = 300
+
+RUN_MODE = {
+    "kind": "single_model",  # "single_model" | "ensemble"
+    "time_budget_seconds": SEARCH_TIME_BUDGET,
+    "final_eval": False,
+    "seed": 1337,
+    "artifact_root": "runs",
+}
+
+MODEL_CFG = {
+    "family": "cnn",  # "cnn" | "vit" | "hybrid"
+    "channels": [64, 128, 256],
+    "blocks_per_stage": 2,
+    "kernel_size": 3,
+    "dropout": 0.10,
+    "classifier_hidden": 256,
+    "use_residual": True,
+    "norm": "batchnorm",  # "batchnorm" | "groupnorm" | "layernorm"
+    "activation": "gelu",  # "relu" | "gelu" | "silu"
+    "patch_size": 7,
+    "embed_dim": 192,
+    "depth": 6,
+    "heads": 6,
+    "mlp_ratio": 4.0,
+    "attention_dropout": 0.0,
+    "stochastic_depth": 0.0,
+    "hybrid_channels": [32, 64],
+}
+
+AUGMENT_CFG = {
+    "random_crop_padding": 2,
+    "random_rotation_degrees": 0.0,
+    "random_affine_degrees": 10.0,
+    "random_affine_translate": 0.10,
+    "random_affine_scale": [0.95, 1.05],
+    "random_affine_shear": 0.0,
+    "elastic_alpha": 0.0,
+    "elastic_sigma": 0.0,
+    "randaugment_ops": 0,
+    "randaugment_magnitude": 5,
+    "random_erasing_prob": 0.0,
+    "random_erasing_scale": [0.02, 0.12],
+    "random_erasing_ratio": [0.3, 3.3],
+    "mixup_alpha": 0.0,
+    "cutmix_alpha": 0.0,
+}
+
+OPTIM_CFG = {
+    "batch_size": 512,
+    "eval_batch_size": 1024,
+    "num_workers": 4,
+    "grad_accum_steps": 1,
+    "optimizer": "adamw",  # "adamw" | "sgd" | "rmsprop"
+    "lr": 2.0e-3,
+    "weight_decay": 1.0e-4,
+    "momentum": 0.9,
+    "betas": [0.9, 0.999],
+    "scheduler": "cosine",  # "cosine" | "linear" | "none"
+    "warmup_ratio": 0.10,
+    "min_lr_ratio": 0.05,
+    "grad_clip": 1.0,
+    "ema_decay": 0.999,
+    "label_smoothing": 0.0,
+}
+
+ENSEMBLE_CFG = {
+    "candidate_limit": 8,
+    "families": ["cnn", "vit", "hybrid"],
+    "roles": ["A", "B", "C", "D"],
+    "max_members": 4,
+    "weight_grid": [0.50, 0.75, 1.00, 1.25, 1.50, 2.00],
+    "temperature_grid": [0.85, 0.95, 1.00, 1.05, 1.15],
+}
+
+# ---------------------------------------------------------------------------
+# Runtime helpers
+# ---------------------------------------------------------------------------
+
+IMAGE_SIZE = 28
 
 
-def norm(x):
-    return F.rms_norm(x, (x.size(-1),))
+def env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.lower() in {"1", "true", "yes", "on"}
 
 
-def has_ve(layer_idx, n_layer):
-    """Returns True if layer should have Value Embedding (alternating, last always included)."""
-    return layer_idx % 2 == (n_layer - 1) % 2
+def runtime_settings() -> dict[str, Any]:
+    kind = os.environ.get("AUTORESEARCH_RUN_MODE_KIND", RUN_MODE["kind"])
+    final_eval = env_flag("AUTORESEARCH_FINAL_EVAL", bool(RUN_MODE["final_eval"]))
+    default_budget = FINAL_TIME_BUDGET if final_eval else int(RUN_MODE["time_budget_seconds"])
+    time_budget = float(os.environ.get("AUTORESEARCH_TIME_BUDGET", default_budget))
+    seed = int(os.environ.get("AUTORESEARCH_SEED", RUN_MODE["seed"]))
+    artifact_root = os.environ.get("AUTORESEARCH_ARTIFACT_ROOT", RUN_MODE["artifact_root"])
+    return {
+        "kind": kind,
+        "final_eval": final_eval,
+        "time_budget_seconds": time_budget,
+        "seed": seed,
+        "artifact_root": artifact_root,
+    }
 
 
-def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:]
-    y1 = x1 * cos + x2 * sin
-    y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3)
+def activation_fn(name: str) -> nn.Module:
+    name = name.lower()
+    if name == "relu":
+        return nn.ReLU(inplace=True)
+    if name == "silu":
+        return nn.SiLU(inplace=True)
+    return nn.GELU()
 
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
+def norm_2d(name: str, channels: int) -> nn.Module:
+    name = name.lower()
+    if name == "groupnorm":
+        groups = 8 if channels % 8 == 0 else 4
+        return nn.GroupNorm(groups, channels)
+    if name == "layernorm":
+        return nn.GroupNorm(1, channels)
+    return nn.BatchNorm2d(channels)
+
+
+class DropPath(nn.Module):
+    def __init__(self, drop_prob: float = 0.0):
         super().__init__()
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        assert self.n_embd % self.n_head == 0
-        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.drop_prob = float(drop_prob)
 
-    def forward(self, x, ve, cos_sin, window_size):
-        B, T, C = x.size()
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-
-        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
-        if ve is not None:
-            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
-            v = v + gate.unsqueeze(-1) * ve
-
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k)
-
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        y = y.contiguous().view(B, T, -1)
-        y = self.c_proj(y)
-        return y
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        return x.div(keep_prob) * random_tensor
 
 
-class MLP(nn.Module):
-    def __init__(self, config):
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, norm: str, activation: str):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        padding = kernel_size // 2
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=False),
+            norm_2d(norm, out_channels),
+            activation_fn(activation),
+        )
 
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
-        x = self.c_proj(x)
-        return x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
 
 
-class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+class ResidualUnit(nn.Module):
+    def __init__(self, channels: int, kernel_size: int, norm: str, activation: str, dropout: float):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        padding = kernel_size // 2
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size, padding=padding, bias=False)
+        self.norm1 = norm_2d(norm, channels)
+        self.act = activation_fn(activation)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size, padding=padding, bias=False)
+        self.norm2 = norm_2d(norm, channels)
+        self.dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
 
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
-        return x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.act(self.norm1(self.conv1(x)))
+        x = self.dropout(x)
+        x = self.norm2(self.conv2(x))
+        return self.act(x + residual)
 
 
-class GPT(nn.Module):
-    def __init__(self, config):
+class ConvNet(nn.Module):
+    def __init__(self, cfg: dict[str, Any]):
         super().__init__()
-        self.config = config
-        self.window_sizes = self._compute_window_sizes(config)
-        self.transformer = nn.ModuleDict({
-            "wte": nn.Embedding(config.vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
-        })
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
-        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
-        # Value embeddings
-        head_dim = config.n_embd // config.n_head
-        kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({
-            str(i): nn.Embedding(config.vocab_size, kv_dim)
-            for i in range(config.n_layer) if has_ve(i, config.n_layer)
-        })
-        # Rotary embeddings
-        self.rotary_seq_len = config.sequence_len * 10
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
+        channels = list(cfg["channels"])
+        blocks_per_stage = int(cfg["blocks_per_stage"])
+        kernel_size = int(cfg["kernel_size"])
+        dropout = float(cfg["dropout"])
+        norm = str(cfg["norm"])
+        activation = str(cfg["activation"])
+        use_residual = bool(cfg["use_residual"])
+        classifier_hidden = int(cfg["classifier_hidden"])
 
-    @torch.no_grad()
-    def init_weights(self):
-        # Embedding and unembedding
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
-        # Transformer blocks
-        n_embd = self.config.n_embd
-        s = 3**0.5 * n_embd**-0.5
-        for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
-        # Per-layer scalars
-        self.resid_lambdas.fill_(1.0)
-        self.x0_lambdas.fill_(0.1)
-        # Value embeddings
-        for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
-        # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
-        for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
-                torch.nn.init.zeros_(block.attn.ve_gate.weight)
-        # Rotary embeddings
-        head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        self.cos, self.sin = cos, sin
-        # Cast embeddings to bf16
-        self.transformer.wte.to(dtype=torch.bfloat16)
-        for ve in self.value_embeds.values():
-            ve.to(dtype=torch.bfloat16)
+        stages = []
+        in_channels = 1
+        for stage_idx, out_channels in enumerate(channels):
+            layers = [ConvBlock(in_channels, out_channels, kernel_size, norm, activation)]
+            if use_residual:
+                layers.extend(
+                    ResidualUnit(out_channels, kernel_size, norm, activation, dropout)
+                    for _ in range(max(0, blocks_per_stage - 1))
+                )
+            else:
+                layers.extend(
+                    ConvBlock(out_channels, out_channels, kernel_size, norm, activation)
+                    for _ in range(max(0, blocks_per_stage - 1))
+                )
+            if stage_idx < len(channels) - 1:
+                layers.append(nn.MaxPool2d(2))
+            stages.append(nn.Sequential(*layers))
+            in_channels = out_channels
 
-    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
-        if device is None:
-            device = self.transformer.wte.weight.device
-        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
-        inv_freq = 1.0 / (base ** (channel_range / head_dim))
-        t = torch.arange(seq_len, dtype=torch.float32, device=device)
-        freqs = torch.outer(t, inv_freq)
-        cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16()
-        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
-        return cos, sin
+        self.features = nn.Sequential(*stages)
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(channels[-1], classifier_hidden),
+            activation_fn(activation),
+            nn.Dropout(dropout),
+            nn.Linear(classifier_hidden, NUM_CLASSES),
+        )
 
-    def _compute_window_sizes(self, config):
-        pattern = config.window_pattern.upper()
-        assert all(c in "SL" for c in pattern)
-        long_window = config.sequence_len
-        short_window = long_window // 2
-        char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
-        window_sizes = []
-        for layer_idx in range(config.n_layer):
-            char = pattern[layer_idx % len(pattern)]
-            window_sizes.append(char_to_window[char])
-        window_sizes[-1] = (long_window, 0)
-        return window_sizes
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        return self.head(x)
 
-    def estimate_flops(self):
-        """Estimated FLOPs per token (forward + backward)."""
-        nparams = sum(p.numel() for p in self.parameters())
-        value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
-        h = self.config.n_head
-        q = self.config.n_embd // self.config.n_head
-        t = self.config.sequence_len
-        attn_flops = 0
-        for window_size in self.window_sizes:
-            window = window_size[0]
-            effective_seq = t if window < 0 else min(window, t)
-            attn_flops += 12 * h * q * effective_seq
-        return 6 * (nparams - nparams_exclude) + attn_flops
 
-    def num_scaling_params(self):
-        wte = sum(p.numel() for p in self.transformer.wte.parameters())
-        value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
-        lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
-        return {
-            'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
-            'transformer_matrices': transformer_matrices, 'scalars': scalars, 'total': total,
+class PatchEmbed(nn.Module):
+    def __init__(self, patch_size: int, embed_dim: int):
+        super().__init__()
+        self.patch_size = int(patch_size)
+        self.proj = nn.Conv2d(1, embed_dim, kernel_size=self.patch_size, stride=self.patch_size)
+        self.grid_h = math.ceil(IMAGE_SIZE / self.patch_size)
+        self.grid_w = math.ceil(IMAGE_SIZE / self.patch_size)
+
+    @property
+    def num_patches(self) -> int:
+        return self.grid_h * self.grid_w
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        pad_h = self.grid_h * self.patch_size - x.size(-2)
+        pad_w = self.grid_w * self.patch_size - x.size(-1)
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+        x = self.proj(x)
+        return x.flatten(2).transpose(1, 2)
+
+
+class VisionTransformer(nn.Module):
+    def __init__(self, cfg: dict[str, Any]):
+        super().__init__()
+        embed_dim = int(cfg["embed_dim"])
+        patch_size = int(cfg["patch_size"])
+        depth = int(cfg["depth"])
+        heads = int(cfg["heads"])
+        mlp_ratio = float(cfg["mlp_ratio"])
+        dropout = float(cfg["dropout"])
+
+        self.patch_embed = PatchEmbed(patch_size=patch_size, embed_dim=embed_dim)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_embed.num_patches + 1, embed_dim))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=heads,
+            dim_feedforward=int(embed_dim * mlp_ratio),
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, NUM_CLASSES)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        tokens = self.patch_embed(x)
+        cls = self.cls_token.expand(tokens.size(0), -1, -1)
+        tokens = torch.cat([cls, tokens], dim=1)
+        tokens = tokens + self.pos_embed[:, : tokens.size(1)]
+        tokens = self.encoder(tokens)
+        tokens = self.norm(tokens[:, 0])
+        return self.head(tokens)
+
+
+class HybridTransformer(nn.Module):
+    def __init__(self, cfg: dict[str, Any]):
+        super().__init__()
+        channels = list(cfg["hybrid_channels"])
+        embed_dim = int(cfg["embed_dim"])
+        depth = int(cfg["depth"])
+        heads = int(cfg["heads"])
+        mlp_ratio = float(cfg["mlp_ratio"])
+        dropout = float(cfg["dropout"])
+        norm = str(cfg["norm"])
+        activation = str(cfg["activation"])
+
+        stem_layers = []
+        in_channels = 1
+        for idx, out_channels in enumerate(channels):
+            stem_layers.append(ConvBlock(in_channels, out_channels, 3, norm, activation))
+            if idx < len(channels) - 1:
+                stem_layers.append(nn.MaxPool2d(2))
+            in_channels = out_channels
+        self.stem = nn.Sequential(*stem_layers)
+        self.proj = nn.Conv2d(channels[-1], embed_dim, kernel_size=1)
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, IMAGE_SIZE, IMAGE_SIZE)
+            feature_map = self.proj(self.stem(dummy))
+            token_count = int(feature_map.shape[-2] * feature_map.shape[-1])
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, token_count + 1, embed_dim))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=heads,
+            dim_feedforward=int(embed_dim * mlp_ratio),
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, NUM_CLASSES)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj(self.stem(x))
+        tokens = x.flatten(2).transpose(1, 2)
+        cls = self.cls_token.expand(tokens.size(0), -1, -1)
+        tokens = torch.cat([cls, tokens], dim=1)
+        tokens = tokens + self.pos_embed[:, : tokens.size(1)]
+        tokens = self.encoder(tokens)
+        tokens = self.norm(tokens[:, 0])
+        return self.head(tokens)
+
+
+def build_model(cfg: dict[str, Any]) -> nn.Module:
+    family = str(cfg["family"]).lower()
+    if family == "vit":
+        return VisionTransformer(cfg)
+    if family == "hybrid":
+        return HybridTransformer(cfg)
+    return ConvNet(cfg)
+
+
+def count_parameters(model: nn.Module) -> int:
+    return sum(parameter.numel() for parameter in model.parameters())
+
+
+class ModelEMA:
+    def __init__(self, model: nn.Module, decay: float):
+        self.decay = float(decay)
+        self.shadow = {
+            name: tensor.detach().clone()
+            for name, tensor in model.state_dict().items()
         }
+        self.backup: dict[str, torch.Tensor] | None = None
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
-                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
-        model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
-        value_embeds_params = list(self.value_embeds.parameters())
-        embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
-        # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
-        dmodel_lr_scale = (model_dim / 768) ** -0.5
-        print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
-        param_groups = [
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
-        ]
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
-            ))
-        optimizer = MuonAdamW(param_groups)
-        for group in optimizer.param_groups:
-            group["initial_lr"] = group["lr"]
-        return optimizer
+    def update(self, model: nn.Module) -> None:
+        with torch.no_grad():
+            current = model.state_dict()
+            for name, tensor in current.items():
+                self.shadow[name].mul_(self.decay).add_(tensor.detach(), alpha=1.0 - self.decay)
 
-    def forward(self, idx, targets=None, reduction='mean'):
-        B, T = idx.size()
-        assert T <= self.cos.size(1)
-        cos_sin = self.cos[:, :T], self.sin[:, :T]
+    def apply_to(self, model: nn.Module) -> None:
+        self.backup = {
+            name: tensor.detach().clone()
+            for name, tensor in model.state_dict().items()
+        }
+        model.load_state_dict(self.shadow, strict=True)
 
-        x = self.transformer.wte(idx)
-        x = norm(x)
-        x0 = x
-        for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
-        x = norm(x)
+    def restore(self, model: nn.Module) -> None:
+        if self.backup is not None:
+            model.load_state_dict(self.backup, strict=True)
+            self.backup = None
 
-        softcap = 15
-        logits = self.lm_head(x)
-        logits = logits.float()
-        logits = softcap * torch.tanh(logits / softcap)
 
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
-                                   ignore_index=-1, reduction=reduction)
-            return loss
-        return logits
+def one_hot_targets(targets: torch.Tensor, label_smoothing: float) -> torch.Tensor:
+    targets_oh = F.one_hot(targets, NUM_CLASSES).float()
+    if label_smoothing <= 0:
+        return targets_oh
+    off_value = label_smoothing / NUM_CLASSES
+    on_value = 1.0 - label_smoothing + off_value
+    return targets_oh * (on_value - off_value) + off_value
 
-# ---------------------------------------------------------------------------
-# Optimizer (MuonAdamW, single GPU only)
-# ---------------------------------------------------------------------------
 
-polar_express_coeffs = [
-    (8.156554524902461, -22.48329292557795, 15.878769915207462),
-    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
-    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
-    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
-    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
-]
+def soft_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    log_probs = F.log_softmax(logits, dim=1)
+    return -(targets * log_probs).sum(dim=1).mean()
 
-@torch.compile(dynamic=False, fullgraph=True)
-def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
-    p.mul_(1 - lr_t * wd_t)
-    exp_avg.lerp_(grad, 1 - beta1_t)
-    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
-    bias1 = 1 - beta1_t ** step_t
-    bias2 = 1 - beta2_t ** step_t
-    denom = (exp_avg_sq / bias2).sqrt() + eps_t
-    step_size = lr_t / bias1
-    p.add_(exp_avg / denom, alpha=-step_size)
 
-@torch.compile(dynamic=False, fullgraph=True)
-def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
-                    momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
-    # Nesterov momentum
-    momentum = momentum_t.to(stacked_grads.dtype)
-    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
-    g = stacked_grads.lerp_(momentum_buffer, momentum)
-    # Polar express orthogonalization
-    X = g.bfloat16()
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
-    if g.size(-2) > g.size(-1):
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X.mT @ X
-            B = b * A + c * (A @ A)
-            X = a * X + X @ B
+def rand_bbox(size: torch.Size, lam: float) -> tuple[int, int, int, int]:
+    _, _, height, width = size
+    cut_ratio = math.sqrt(max(0.0, 1.0 - lam))
+    cut_w = max(1, int(width * cut_ratio))
+    cut_h = max(1, int(height * cut_ratio))
+    cx = torch.randint(0, width, (1,)).item()
+    cy = torch.randint(0, height, (1,)).item()
+    x1 = max(cx - cut_w // 2, 0)
+    y1 = max(cy - cut_h // 2, 0)
+    x2 = min(cx + cut_w // 2, width)
+    y2 = min(cy + cut_h // 2, height)
+    return x1, y1, x2, y2
+
+
+def apply_batch_mix(
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    augment_cfg: dict[str, Any],
+    label_smoothing: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    mixup_alpha = float(augment_cfg.get("mixup_alpha", 0.0))
+    cutmix_alpha = float(augment_cfg.get("cutmix_alpha", 0.0))
+    if mixup_alpha <= 0 and cutmix_alpha <= 0:
+        return inputs, one_hot_targets(targets, label_smoothing)
+
+    perm = torch.randperm(inputs.size(0), device=inputs.device)
+    targets_a = one_hot_targets(targets, label_smoothing)
+    targets_b = one_hot_targets(targets[perm], label_smoothing)
+
+    if cutmix_alpha > 0:
+        lam = torch.distributions.Beta(cutmix_alpha, cutmix_alpha).sample().item()
+        x1, y1, x2, y2 = rand_bbox(inputs.size(), lam)
+        mixed = inputs.clone()
+        mixed[:, :, y1:y2, x1:x2] = inputs[perm, :, y1:y2, x1:x2]
+        lam = 1.0 - ((x2 - x1) * (y2 - y1) / (inputs.size(-1) * inputs.size(-2)))
+        return mixed, lam * targets_a + (1.0 - lam) * targets_b
+
+    lam = torch.distributions.Beta(mixup_alpha, mixup_alpha).sample().item()
+    mixed = lam * inputs + (1.0 - lam) * inputs[perm]
+    return mixed, lam * targets_a + (1.0 - lam) * targets_b
+
+
+def build_optimizer(model: nn.Module, cfg: dict[str, Any]) -> torch.optim.Optimizer:
+    optimizer_name = str(cfg["optimizer"]).lower()
+    lr = float(cfg["lr"])
+    weight_decay = float(cfg["weight_decay"])
+    if optimizer_name == "sgd":
+        return torch.optim.SGD(
+            model.parameters(),
+            lr=lr,
+            momentum=float(cfg["momentum"]),
+            weight_decay=weight_decay,
+            nesterov=True,
+        )
+    if optimizer_name == "rmsprop":
+        return torch.optim.RMSprop(
+            model.parameters(),
+            lr=lr,
+            momentum=float(cfg["momentum"]),
+            weight_decay=weight_decay,
+        )
+    betas = tuple(cfg.get("betas", [0.9, 0.999]))
+    return torch.optim.AdamW(model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
+
+
+def lr_multiplier(progress: float, cfg: dict[str, Any]) -> float:
+    progress = min(max(progress, 0.0), 1.0)
+    warmup_ratio = float(cfg.get("warmup_ratio", 0.0))
+    min_lr_ratio = float(cfg.get("min_lr_ratio", 0.0))
+    scheduler = str(cfg.get("scheduler", "cosine")).lower()
+
+    if warmup_ratio > 0 and progress < warmup_ratio:
+        return max(1e-6, progress / warmup_ratio)
+
+    post_warmup = 0.0 if warmup_ratio >= 1.0 else (progress - warmup_ratio) / max(1e-8, 1.0 - warmup_ratio)
+    if scheduler == "none":
+        return 1.0
+    if scheduler == "linear":
+        return min_lr_ratio + (1.0 - post_warmup) * (1.0 - min_lr_ratio)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * post_warmup))
+    return min_lr_ratio + cosine * (1.0 - min_lr_ratio)
+
+
+@contextlib.contextmanager
+def autocast_context(device: torch.device):
+    if device.type == "cuda" and torch.cuda.is_bf16_supported():
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            yield
     else:
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X @ X.mT
-            B = b * A + c * (A @ A)
-            X = a * X + B @ X
-    g = X
-    # NorMuon variance reduction
-    beta2 = beta2_t.to(g.dtype)
-    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
-    red_dim_size = g.size(red_dim)
-    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
-    v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
-    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
-    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
-    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
-    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
-    g = g * final_scale.to(g.dtype)
-    # Cautious weight decay + parameter update
-    lr = lr_t.to(g.dtype)
-    wd = wd_t.to(g.dtype)
-    mask = (g * stacked_params) >= 0
-    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+        yield
 
 
-class MuonAdamW(torch.optim.Optimizer):
-    """Combined optimizer: Muon for 2D matrix params, AdamW for others."""
+def json_sha(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True).encode()
+    return hashlib.sha256(encoded).hexdigest()[:12]
 
-    def __init__(self, param_groups):
-        super().__init__(param_groups, defaults={})
-        # 0-D CPU tensors to avoid torch.compile recompilation when values change
-        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
-    def _step_adamw(self, group):
-        for p in group['params']:
-            if p.grad is None:
-                continue
-            grad = p.grad
-            state = self.state[p]
-            if not state:
-                state['step'] = 0
-                state['exp_avg'] = torch.zeros_like(p)
-                state['exp_avg_sq'] = torch.zeros_like(p)
-            state['step'] += 1
-            self._adamw_step_t.fill_(state['step'])
-            self._adamw_lr_t.fill_(group['lr'])
-            self._adamw_beta1_t.fill_(group['betas'][0])
-            self._adamw_beta2_t.fill_(group['betas'][1])
-            self._adamw_eps_t.fill_(group['eps'])
-            self._adamw_wd_t.fill_(group['weight_decay'])
-            adamw_step_fused(p, grad, state['exp_avg'], state['exp_avg_sq'],
-                            self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                            self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
+def make_artifact_dir(runtime: dict[str, Any], model_cfg: dict[str, Any]) -> Path:
+    workspace_root = Path(os.environ.get("AUTORESEARCH_WORKSPACE_ROOT", str(Path.cwd())))
+    artifact_root = Path(runtime["artifact_root"])
+    if not artifact_root.is_absolute():
+        artifact_root = workspace_root / artifact_root
+    run_id = os.environ.get("AUTORESEARCH_EXPERIMENT_KEY")
+    if not run_id:
+        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        family = str(model_cfg["family"]).lower()
+        run_id = f"{runtime['kind']}-{family}-{timestamp}"
+    artifact_dir = artifact_root / run_id
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    return artifact_dir
 
-    def _step_muon(self, group):
-        params = group['params']
-        if not params:
-            return
-        p = params[0]
-        state = self.state[p]
-        num_params = len(params)
-        shape, device, dtype = p.shape, p.device, p.dtype
-        if "momentum_buffer" not in state:
-            state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
-        if "second_momentum_buffer" not in state:
-            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
-        red_dim = -1 if shape[-2] >= shape[-1] else -2
-        stacked_grads = torch.stack([p.grad for p in params])
-        stacked_params = torch.stack(params)
-        self._muon_momentum_t.fill_(group["momentum"])
-        self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
-        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
-        self._muon_wd_t.fill_(group["weight_decay"])
-        muon_step_fused(stacked_grads, stacked_params,
-                        state["momentum_buffer"], state["second_momentum_buffer"],
-                        self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
-                        self._muon_beta2_t, group["ns_steps"], red_dim)
-        torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
-    @torch.no_grad()
-    def step(self):
-        for group in self.param_groups:
-            if group['kind'] == 'adamw':
-                self._step_adamw(group)
-            elif group['kind'] == 'muon':
-                self._step_muon(group)
+def save_json(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n")
 
-# ---------------------------------------------------------------------------
-# Hyperparameters (edit these directly, no CLI flags needed)
-# ---------------------------------------------------------------------------
 
-# Model architecture
-ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+def evaluate_logits(logits: torch.Tensor, targets: torch.Tensor, temperature: float = 1.0) -> dict[str, Any]:
+    scaled = logits / temperature
+    loss = F.cross_entropy(scaled, targets).item()
+    predictions = scaled.argmax(dim=1)
+    errors = int((predictions != targets).sum().item())
+    accuracy = float((predictions == targets).float().mean().item())
+    return {"loss": loss, "errors": errors, "accuracy": accuracy, "temperature": temperature}
 
-# Optimization
-TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
-EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
-UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
-SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
-ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
-# Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+def load_single_checkpoint(checkpoint_path: str | os.PathLike[str], device: torch.device) -> nn.Module:
+    payload = torch.load(checkpoint_path, map_location=device)
+    model = build_model(payload["model_cfg"]).to(device)
+    model.load_state_dict(payload["state_dict"])
+    model.eval()
+    return model
 
-# ---------------------------------------------------------------------------
-# Setup: tokenizer, model, optimizer, dataloader
-# ---------------------------------------------------------------------------
 
-t_start = time.time()
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
+def evaluate_single_model(
+    model: nn.Module,
+    loaders: dict[str, Any],
+    device: torch.device,
+    *,
+    final_eval: bool,
+) -> dict[str, Any]:
+    val_metrics = evaluate_model(model, loaders["val"], device, collect_logits=True)
+    metrics = {
+        "val_loss": float(val_metrics["loss"]),
+        "val_accuracy": float(val_metrics["accuracy"]),
+        "val_errors": int(val_metrics["errors"]),
+        "val_logits": val_metrics["logits"],
+        "val_targets": val_metrics["targets"],
+    }
+    if final_eval:
+        test_metrics = evaluate_model(model, loaders["test"], device, collect_logits=False)
+        metrics.update(
+            {
+                "test_loss": float(test_metrics["loss"]),
+                "test_accuracy": float(test_metrics["accuracy"]),
+                "test_errors": int(test_metrics["errors"]),
+            }
+        )
+    return metrics
 
-tokenizer = Tokenizer.from_directory()
-vocab_size = tokenizer.get_vocab_size()
-print(f"Vocab size: {vocab_size:,}")
 
-def build_model_config(depth):
-    base_dim = depth * ASPECT_RATIO
-    model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
-    num_heads = model_dim // HEAD_DIM
-    return GPTConfig(
-        sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=WINDOW_PATTERN,
+def run_single_model(
+    runtime: dict[str, Any],
+    device: torch.device,
+    coord: Coordinator,
+) -> dict[str, Any]:
+    torch.manual_seed(runtime["seed"])
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(runtime["seed"])
+        torch.backends.cudnn.benchmark = True
+
+    loaders = make_dataloaders(
+        augment_cfg=AUGMENT_CFG,
+        batch_size=int(OPTIM_CFG["batch_size"]),
+        eval_batch_size=int(OPTIM_CFG["eval_batch_size"]),
+        num_workers=int(OPTIM_CFG["num_workers"]),
+    )
+    train_iterator = cycle(loaders["train"])
+
+    model = build_model(MODEL_CFG).to(device)
+    optimizer = build_optimizer(model, OPTIM_CFG)
+    ema_decay = float(OPTIM_CFG.get("ema_decay", 0.0))
+    ema = ModelEMA(model, ema_decay) if ema_decay > 0 else None
+    grad_accum_steps = max(1, int(OPTIM_CFG.get("grad_accum_steps", 1)))
+    grad_clip = float(OPTIM_CFG.get("grad_clip", 0.0))
+    label_smoothing = float(OPTIM_CFG.get("label_smoothing", 0.0))
+    num_params = count_parameters(model)
+
+    artifact_dir = make_artifact_dir(runtime, MODEL_CFG)
+    config_blob = {
+        "runtime": runtime,
+        "model_cfg": MODEL_CFG,
+        "augment_cfg": AUGMENT_CFG,
+        "optim_cfg": OPTIM_CFG,
+        "ensemble_cfg": ENSEMBLE_CFG,
+    }
+    config_sha = json_sha(config_blob)
+    config_path = artifact_dir / "config.json"
+    save_json(config_path, config_blob)
+
+    start_time = time.time()
+    train_loss_ema = 0.0
+    steps = 0
+    samples_seen = 0
+    progress_log_interval = 10
+
+    while time.time() - start_time < runtime["time_budget_seconds"]:
+        optimizer.zero_grad(set_to_none=True)
+        batch_loss_value = 0.0
+        for _ in range(grad_accum_steps):
+            inputs, targets = next(train_iterator)
+            inputs = inputs.to(device, non_blocking=device.type == "cuda")
+            targets = targets.to(device, non_blocking=device.type == "cuda")
+            inputs, soft_targets = apply_batch_mix(inputs, targets, AUGMENT_CFG, label_smoothing)
+
+            with autocast_context(device):
+                logits = model(inputs)
+                loss = soft_cross_entropy(logits, soft_targets) / grad_accum_steps
+            loss.backward()
+            batch_loss_value += loss.item() * grad_accum_steps
+            samples_seen += int(inputs.size(0))
+
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+        progress = (time.time() - start_time) / runtime["time_budget_seconds"]
+        lr_mult = lr_multiplier(progress, OPTIM_CFG)
+        for group in optimizer.param_groups:
+            group["lr"] = float(OPTIM_CFG["lr"]) * lr_mult
+
+        optimizer.step()
+        if ema is not None:
+            ema.update(model)
+
+        train_loss_ema = 0.9 * train_loss_ema + 0.1 * batch_loss_value if steps > 0 else batch_loss_value
+        steps += 1
+
+        if steps % progress_log_interval == 0:
+            elapsed = time.time() - start_time
+            print(
+                f"step={steps:04d} elapsed={elapsed:6.1f}s "
+                f"train_loss={train_loss_ema:.5f} lr={optimizer.param_groups[0]['lr']:.6f}",
+                flush=True,
+            )
+
+    eval_model_instance = model
+    if ema is not None:
+        ema.apply_to(model)
+        eval_model_instance = model
+
+    evaluation = evaluate_single_model(eval_model_instance, loaders, device, final_eval=runtime["final_eval"])
+    state_dict_to_save = {
+        name: tensor.detach().cpu()
+        for name, tensor in eval_model_instance.state_dict().items()
+    }
+
+    if ema is not None:
+        ema.restore(model)
+
+    checkpoint_path = artifact_dir / "checkpoint.pt"
+    torch.save(
+        {
+            "model_cfg": MODEL_CFG,
+            "state_dict": state_dict_to_save,
+            "config_sha": config_sha,
+            "model_family": MODEL_CFG["family"],
+        },
+        checkpoint_path,
     )
 
-config = build_model_config(DEPTH)
-print(f"Model config: {asdict(config)}")
+    val_logits_path = artifact_dir / "val_logits.pt"
+    save_logits_artifact(
+        val_logits_path,
+        evaluation["val_logits"],
+        evaluation["val_targets"],
+        metadata={"config_sha": config_sha, "model_family": MODEL_CFG["family"]},
+    )
 
-with torch.device("meta"):
-    model = GPT(config)
-model.to_empty(device=device)
-model.init_weights()
+    peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024 if device.type == "cuda" else 0.0
+    training_seconds = time.time() - start_time
+    metadata = {
+        "config_sha": config_sha,
+        "model_family": MODEL_CFG["family"],
+        "run_mode": runtime["kind"],
+        "num_params": num_params,
+        "train_loss": float(train_loss_ema),
+        "training_seconds": training_seconds,
+        "steps": steps,
+        "samples_seen": samples_seen,
+        "peak_vram_mb": peak_vram_mb,
+        "val_errors": evaluation["val_errors"],
+        "val_accuracy": evaluation["val_accuracy"],
+        "val_loss": evaluation["val_loss"],
+        "checkpoint_path": str(checkpoint_path),
+        "config_path": str(config_path),
+        "val_logits_path": str(val_logits_path),
+        "final_eval": runtime["final_eval"],
+    }
+    if runtime["final_eval"]:
+        metadata.update(
+            {
+                "test_errors": evaluation["test_errors"],
+                "test_accuracy": evaluation["test_accuracy"],
+                "test_loss": evaluation["test_loss"],
+            }
+        )
 
-param_counts = model.num_scaling_params()
-print("Parameter counts:")
-for key, value in param_counts.items():
-    print(f"  {key:24s}: {value:,}")
-num_params = param_counts['total']
-num_flops_per_token = model.estimate_flops()
-print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
+    metadata_path = artifact_dir / "metadata.json"
+    save_json(metadata_path, metadata)
+    metadata["metadata_path"] = str(metadata_path)
+    return metadata
 
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
-assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
-optimizer = model.setup_optimizer(
-    unembedding_lr=UNEMBEDDING_LR,
-    embedding_lr=EMBEDDING_LR,
-    scalar_lr=SCALAR_LR,
-    adam_betas=ADAM_BETAS,
-    matrix_lr=MATRIX_LR,
-    weight_decay=WEIGHT_DECAY,
-)
+def ensemble_candidates(coord: Coordinator) -> list[dict[str, Any]]:
+    return coord.get_ranked_results(
+        limit=int(ENSEMBLE_CFG["candidate_limit"]),
+        status="keep",
+        run_mode="single_model",
+        families=list(ENSEMBLE_CFG.get("families", [])),
+        roles=list(ENSEMBLE_CFG.get("roles", [])),
+        final_eval=False,
+    )
 
-model = torch.compile(model, dynamic=False)
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
-x, y, epoch = next(train_loader)  # prefetch first batch
+def greedy_ensemble_search(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    prepared = []
+    for row in candidates:
+        metrics = row["metrics"]
+        payload = torch.load(metrics["val_logits_path"], map_location="cpu")
+        prepared.append(
+            {
+                "record": row,
+                "logits": payload["logits"].float(),
+                "targets": payload["targets"].long(),
+                "weight": 1.0,
+            }
+        )
 
-print(f"Time budget: {TIME_BUDGET}s")
-print(f"Gradient accumulation steps: {grad_accum_steps}")
+    if not prepared:
+        raise RuntimeError("No eligible checkpoints found in shared/best_checkpoints for ensemble mode")
 
-# Schedules (all based on progress = training_time / TIME_BUDGET)
+    reference_targets = prepared[0]["targets"]
+    for candidate in prepared[1:]:
+        if not torch.equal(reference_targets, candidate["targets"]):
+            raise RuntimeError("Validation target mismatch across candidate checkpoints")
 
-def get_lr_multiplier(progress):
-    if progress < WARMUP_RATIO:
-        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
-    elif progress < 1.0 - WARMDOWN_RATIO:
-        return 1.0
-    else:
-        cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
+    temp_grid = [float(value) for value in ENSEMBLE_CFG["temperature_grid"]]
+    weight_grid = [float(value) for value in ENSEMBLE_CFG["weight_grid"]]
+    max_members = int(ENSEMBLE_CFG["max_members"])
 
-def get_muon_momentum(step):
-    frac = min(step / 300, 1)
-    return (1 - frac) * 0.85 + frac * 0.95
+    def score(combo: list[dict[str, Any]], temperature: float) -> dict[str, Any]:
+        total_weight = sum(member["weight"] for member in combo)
+        logits = sum(member["weight"] * member["logits"] for member in combo) / total_weight
+        metrics = evaluate_logits(logits, reference_targets, temperature=temperature)
+        metrics["logits"] = logits
+        return metrics
 
-def get_weight_decay(progress):
-    return WEIGHT_DECAY * (1 - progress)
+    best_single = min(prepared, key=lambda item: item["record"]["metrics"]["val_errors"])
+    selected = [best_single]
+    best_metrics = min((score(selected, temp) for temp in temp_grid), key=lambda item: (item["errors"], item["loss"]))
+    best_temperature = best_metrics["temperature"]
 
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
+    remaining = [candidate for candidate in prepared if candidate is not best_single]
+    while remaining and len(selected) < max_members:
+        improvement = None
+        for candidate in remaining:
+            for weight in weight_grid:
+                trial_member = dict(candidate)
+                trial_member["weight"] = weight
+                trial_combo = selected + [trial_member]
+                trial_metrics = min(
+                    (score(trial_combo, temp) for temp in temp_grid),
+                    key=lambda item: (item["errors"], item["loss"]),
+                )
+                trial_signature = (trial_metrics["errors"], trial_metrics["loss"])
+                best_signature = (best_metrics["errors"], best_metrics["loss"])
+                if trial_signature < best_signature:
+                    improvement = (candidate, weight, trial_metrics)
+                    best_signature = trial_signature
 
-t_start_training = time.time()
-smooth_train_loss = 0
-total_training_time = 0
-step = 0
+        if improvement is None:
+            break
 
-while True:
-    torch.cuda.synchronize()
-    t0 = time.time()
-    for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            loss = model(x, y)
-        train_loss = loss.detach()
-        loss = loss / grad_accum_steps
-        loss.backward()
-        x, y, epoch = next(train_loader)
+        candidate, weight, trial_metrics = improvement
+        accepted = dict(candidate)
+        accepted["weight"] = weight
+        selected.append(accepted)
+        remaining = [item for item in remaining if item is not candidate]
+        best_metrics = trial_metrics
+        best_temperature = trial_metrics["temperature"]
 
-    # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
-    lrm = get_lr_multiplier(progress)
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(progress)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
-    optimizer.step()
-    model.zero_grad(set_to_none=True)
+    return {
+        "selected": selected,
+        "temperature": best_temperature,
+        "val_metrics": best_metrics,
+        "targets": reference_targets,
+    }
 
-    train_loss_f = train_loss.item()
 
-    # Fast fail: abort if loss is exploding or NaN
-    if math.isnan(train_loss_f) or train_loss_f > 100:
-        print("FAIL")
-        exit(1)
+@torch.no_grad()
+def evaluate_ensemble_on_loader(selected: list[dict[str, Any]], loader, device: torch.device, temperature: float) -> dict[str, Any]:
+    models = []
+    for member in selected:
+        checkpoint_path = member["record"]["metrics"]["checkpoint_path"]
+        models.append((load_single_checkpoint(checkpoint_path, device), float(member["weight"])))
 
-    torch.cuda.synchronize()
-    t1 = time.time()
-    dt = t1 - t0
+    total_loss = 0.0
+    total_examples = 0
+    total_errors = 0
+    for inputs, targets in loader:
+        inputs = inputs.to(device, non_blocking=device.type == "cuda")
+        targets = targets.to(device, non_blocking=device.type == "cuda")
+        ensemble_logits = None
+        total_weight = 0.0
+        for model, weight in models:
+            logits = model(inputs)
+            ensemble_logits = logits * weight if ensemble_logits is None else ensemble_logits + logits * weight
+            total_weight += weight
+        ensemble_logits = ensemble_logits / total_weight
+        scaled_logits = ensemble_logits / temperature
+        total_loss += F.cross_entropy(scaled_logits, targets, reduction="sum").item()
+        total_errors += int((scaled_logits.argmax(dim=1) != targets).sum().item())
+        total_examples += int(targets.numel())
 
-    if step > 10:
-        total_training_time += dt
+    return {
+        "loss": total_loss / max(1, total_examples),
+        "errors": total_errors,
+        "accuracy": 1.0 - (total_errors / max(1, total_examples)),
+    }
 
-    # Logging
-    ema_beta = 0.9
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
-    pct_done = 100 * progress
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+def run_ensemble(
+    runtime: dict[str, Any],
+    device: torch.device,
+    coord: Coordinator,
+) -> dict[str, Any]:
+    loaders = make_dataloaders(
+        augment_cfg={},
+        batch_size=int(OPTIM_CFG["batch_size"]),
+        eval_batch_size=int(OPTIM_CFG["eval_batch_size"]),
+        num_workers=int(OPTIM_CFG["num_workers"]),
+    )
+    candidates = ensemble_candidates(coord)
+    search = greedy_ensemble_search(candidates)
+    artifact_dir = make_artifact_dir(runtime, {"family": "ensemble"})
 
-    # GC management (Python's GC causes ~500ms stalls)
-    if step == 0:
-        gc.collect()
-        gc.freeze()
-        gc.disable()
-    elif (step + 1) % 5000 == 0:
-        gc.collect()
+    ensemble_logits_path = artifact_dir / "val_logits.pt"
+    save_logits_artifact(
+        ensemble_logits_path,
+        search["val_metrics"]["logits"],
+        search["targets"],
+        metadata={"temperature": search["temperature"], "members": len(search["selected"])},
+    )
 
-    step += 1
+    members = []
+    for member in search["selected"]:
+        members.append(
+            {
+                "experiment_key": member["record"]["experiment_key"],
+                "role": member["record"]["role"],
+                "weight": member["weight"],
+                "checkpoint_path": member["record"]["metrics"]["checkpoint_path"],
+                "config_path": member["record"]["metrics"].get("config_path"),
+                "model_family": member["record"]["metrics"]["model_family"],
+                "val_errors": member["record"]["metrics"]["val_errors"],
+            }
+        )
 
-    # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
-        break
+    manifest = {
+        "run_mode": runtime["kind"],
+        "model_family": "ensemble",
+        "temperature": search["temperature"],
+        "members": members,
+        "val_errors": int(search["val_metrics"]["errors"]),
+        "val_accuracy": float(search["val_metrics"]["accuracy"]),
+        "val_loss": float(search["val_metrics"]["loss"]),
+    }
 
-print()  # newline after \r training log
+    if runtime["final_eval"]:
+        test_metrics = evaluate_ensemble_on_loader(search["selected"], loaders["test"], device, search["temperature"])
+        manifest.update(
+            {
+                "test_errors": int(test_metrics["errors"]),
+                "test_accuracy": float(test_metrics["accuracy"]),
+                "test_loss": float(test_metrics["loss"]),
+            }
+        )
 
-total_tokens = step * TOTAL_BATCH_SIZE
+    manifest_path = artifact_dir / "ensemble_manifest.json"
+    save_json(manifest_path, manifest)
+    metadata_path = artifact_dir / "metadata.json"
+    save_json(metadata_path, manifest)
 
-# Final eval
-model.eval()
-with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024 if device.type == "cuda" else 0.0
+    manifest.update(
+        {
+            "train_loss": 0.0,
+            "training_seconds": 0.0,
+            "peak_vram_mb": peak_vram_mb,
+            "checkpoint_path": None,
+            "config_path": None,
+            "val_logits_path": str(ensemble_logits_path),
+            "manifest_path": str(manifest_path),
+            "metadata_path": str(metadata_path),
+            "config_sha": json_sha(manifest),
+        }
+    )
+    return manifest
 
-# Final summary
-t_end = time.time()
-startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
-print("---")
-print(f"val_bpb:          {val_bpb:.6f}")
-print(f"training_seconds: {total_training_time:.1f}")
-print(f"total_seconds:    {t_end - t_start:.1f}")
-print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-print(f"mfu_percent:      {steady_state_mfu:.2f}")
-print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
-print(f"num_steps:        {step}")
-print(f"num_params_M:     {num_params / 1e6:.1f}")
-print(f"depth:            {DEPTH}")
+def print_summary(metrics: dict[str, Any]) -> None:
+    print("---")
+    keys = [
+        ("val_errors", metrics.get("val_errors")),
+        ("val_accuracy", metrics.get("val_accuracy")),
+        ("val_loss", metrics.get("val_loss")),
+        ("train_loss", metrics.get("train_loss")),
+        ("training_seconds", metrics.get("training_seconds")),
+        ("peak_vram_mb", metrics.get("peak_vram_mb")),
+        ("checkpoint_path", metrics.get("checkpoint_path")),
+        ("run_mode", metrics.get("run_mode")),
+        ("model_family", metrics.get("model_family")),
+        ("config_sha", metrics.get("config_sha")),
+    ]
+    optional = [("test_errors", metrics.get("test_errors")), ("test_accuracy", metrics.get("test_accuracy"))]
+    for key, value in keys + optional:
+        if value is None:
+            continue
+        if isinstance(value, float):
+            print(f"{key}: {value:.6f}")
+        else:
+            print(f"{key}: {value}")
+
+
+def main() -> None:
+    runtime = runtime_settings()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    coord = Coordinator()
+
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+
+    with coord.gpu_lease():
+        if runtime["kind"] == "ensemble":
+            metrics = run_ensemble(runtime, device, coord)
+        else:
+            metrics = run_single_model(runtime, device, coord)
+
+    print_summary(metrics)
+
+
+if __name__ == "__main__":
+    main()

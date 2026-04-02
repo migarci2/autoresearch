@@ -1,0 +1,150 @@
+version: 1
+
+deploy:
+  target: runpod
+  runpod:
+    workspace_dir: /workspace
+    app_dir: /workspace/autoresearch
+    image_app_dir: /opt/autoresearch/app
+    dashboard_port: 8080
+    ssh_port: 22
+    auto_bootstrap: true
+    code_sync_mode: image_to_workspace
+    supervisor_restart_policy: unless-stopped
+
+paths:
+  shared_dir: shared
+  homes_dir: homes
+  worktrees_dir: worktrees
+  logs_dir: swarm_logs
+  runtime_dir: shared/runtime
+  prompt_root: .
+  compose_file: compose.yaml
+
+defaults:
+  model: gpt-5.4
+  reasoning_effort: medium
+  time_budget_seconds: 45
+  final_time_budget_seconds: 300
+  final_eval: false
+  seed: 1337
+  artifact_root: runs
+  model_family: generic
+
+auth:
+  mode: chatgpt_cache
+  capture:
+    preferred: local_browser
+    fallbacks:
+      - device_auth
+      - ssh_callback_tunnel
+  vault_path: secrets/codex-vault
+  remote_sync_path: secrets/codex-vault
+  credentials_store: file
+  passphrase_env: SWARM_VAULT_PASSPHRASE
+  passphrase_file_env: SWARM_VAULT_PASSPHRASE_FILE
+  lease_ttl_seconds: 900
+  lease_heartbeat_seconds: 15
+  suspect_cooldown_seconds: 900
+  max_auth_retries: 3
+
+codex:
+  login_command: ["codex", "login"]
+  status_command: ["codex", "login", "status"]
+  auth_payload_files:
+    - config.toml
+    - auth.json
+    - credentials.json
+    - device.json
+  exec_base_args:
+    - codex
+    - exec
+    - -s
+    - danger-full-access
+    - -a
+    - never
+
+compose:
+  enabled: true
+  project_name: autoresearch
+  file: compose.yaml
+  agent_service_prefix: agent-
+  toolbox_service: toolbox
+  dashboard_service: dashboard
+
+dashboard:
+  enabled: true
+  refresh_seconds: 5
+  chart_window: 200
+  log_tail_lines: 200
+
+accounts:
+  primary:
+    id: primary
+    label: Shared ChatGPT Account
+    capacity: 5
+    enabled: true
+    metadata:
+      owner: local
+
+agents:
+  A:
+    agent_id: agent-a
+    role: A
+    label: CNN Architect
+    family: cnn
+    branch: autoresearch/mnist-agent-a
+    prompt_file: program_agent_a.md
+    model: gpt-5.4
+    reasoning_effort: high
+    enabled: true
+    extra_codex_args: []
+    env: {}
+  B:
+    agent_id: agent-b
+    role: B
+    label: ViT Researcher
+    family: vit
+    branch: autoresearch/mnist-agent-b
+    prompt_file: program_agent_b.md
+    model: gpt-5.4
+    reasoning_effort: high
+    enabled: true
+    extra_codex_args: []
+    env: {}
+  C:
+    agent_id: agent-c
+    role: C
+    label: Augmentation Researcher
+    family: augmentation
+    branch: autoresearch/mnist-agent-c
+    prompt_file: program_agent_c.md
+    model: gpt-5.4
+    reasoning_effort: medium
+    enabled: true
+    extra_codex_args: []
+    env: {}
+  D:
+    agent_id: agent-d
+    role: D
+    label: Optimizer Researcher
+    family: optimizer
+    branch: autoresearch/mnist-agent-d
+    prompt_file: program_agent_d.md
+    model: gpt-5.4
+    reasoning_effort: medium
+    enabled: true
+    extra_codex_args: []
+    env: {}
+  E:
+    agent_id: agent-e
+    role: E
+    label: Ensemble Builder
+    family: ensemble
+    branch: autoresearch/mnist-agent-e
+    prompt_file: program_agent_e.md
+    model: gpt-5.4
+    reasoning_effort: medium
+    enabled: true
+    extra_codex_args: []
+    env: {}

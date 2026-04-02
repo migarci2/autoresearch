@@ -1,0 +1,174 @@
+name: autoresearch-mnist
+
+x-common-build: &common-build
+  context: .
+  dockerfile: Dockerfile
+  args:
+    NODE_MAJOR: ${NODE_MAJOR:-22}
+
+x-common-env: &common-env
+  AUTORESEARCH_WORKSPACE_ROOT: /workspace
+  AUTORESEARCH_SHARED_DIR: /workspace/shared
+  AUTORESEARCH_HOMES_DIR: /workspace/homes
+  AUTORESEARCH_WORKTREES_DIR: /workspace/worktrees
+  AUTORESEARCH_LOG_DIR: /workspace/swarm_logs
+  AUTORESEARCH_CONFIG_FILE: /workspace/config/swarm.yaml
+  AUTORESEARCH_CONFIG_PATH: /workspace/config/swarm.yaml
+  SWARM_CONFIG_PATH: /workspace/config/swarm.yaml
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONPATH: /workspace
+  TERM: xterm-256color
+  NVIDIA_DRIVER_CAPABILITIES: compute,utility
+  NVIDIA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-all}
+
+x-common-service: &common-service
+  build: *common-build
+  image: ${AUTORESEARCH_IMAGE_NAME:-autoresearch-mnist:cuda128}
+  init: true
+  stdin_open: true
+  tty: true
+  user: "${UID:-1000}:${GID:-1000}"
+  working_dir: /workspace
+  env_file:
+    - path: .env.secrets
+      required: false
+  environment: *common-env
+  volumes:
+    - type: bind
+      source: .
+      target: /workspace
+  tmpfs:
+    - /tmp
+    - /var/tmp
+  shm_size: "1gb"
+  restart: unless-stopped
+  logging: &default-logging
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-agent-base: &agent-base
+  <<: *common-service
+  gpus: all
+  command:
+    - bash
+    - -lc
+    - |
+        set -euo pipefail
+        role="$${AUTORESEARCH_ROLE:?AUTORESEARCH_ROLE is required}"
+        exec python3 /workspace/scripts/run_agent.py run --role "$$role"
+
+services:
+  toolbox:
+    <<: *common-service
+    restart: "no"
+    command:
+      - bash
+      - -lc
+      - exec tail -f /dev/null
+    environment:
+      <<: *common-env
+      AUTORESEARCH_AGENT_ID: toolbox
+      AUTORESEARCH_ROLE: toolbox
+      AUTORESEARCH_PROGRAM_FILE: /workspace/program.md
+      AUTORESEARCH_WORKTREE_DIR: /workspace
+      HOME: /workspace/homes/toolbox
+      XDG_CACHE_HOME: /workspace/homes/toolbox/.cache
+      XDG_CONFIG_HOME: /workspace/homes/toolbox/.config
+      XDG_STATE_HOME: /workspace/homes/toolbox/.local/state
+
+  agent-a:
+    <<: *agent-base
+    working_dir: /workspace/worktrees/agent-a
+    environment:
+      <<: *common-env
+      AUTORESEARCH_AGENT_ID: agent-a
+      AUTORESEARCH_ROLE: A
+      AUTORESEARCH_PROGRAM_FILE: /workspace/program_agent_a.md
+      AUTORESEARCH_WORKTREE_DIR: /workspace/worktrees/agent-a
+      HOME: /workspace/homes/agent-a
+      XDG_CACHE_HOME: /workspace/homes/agent-a/.cache
+      XDG_CONFIG_HOME: /workspace/homes/agent-a/.config
+      XDG_STATE_HOME: /workspace/homes/agent-a/.local/state
+
+  agent-b:
+    <<: *agent-base
+    working_dir: /workspace/worktrees/agent-b
+    environment:
+      <<: *common-env
+      AUTORESEARCH_AGENT_ID: agent-b
+      AUTORESEARCH_ROLE: B
+      AUTORESEARCH_PROGRAM_FILE: /workspace/program_agent_b.md
+      AUTORESEARCH_WORKTREE_DIR: /workspace/worktrees/agent-b
+      HOME: /workspace/homes/agent-b
+      XDG_CACHE_HOME: /workspace/homes/agent-b/.cache
+      XDG_CONFIG_HOME: /workspace/homes/agent-b/.config
+      XDG_STATE_HOME: /workspace/homes/agent-b/.local/state
+
+  agent-c:
+    <<: *agent-base
+    working_dir: /workspace/worktrees/agent-c
+    environment:
+      <<: *common-env
+      AUTORESEARCH_AGENT_ID: agent-c
+      AUTORESEARCH_ROLE: C
+      AUTORESEARCH_PROGRAM_FILE: /workspace/program_agent_c.md
+      AUTORESEARCH_WORKTREE_DIR: /workspace/worktrees/agent-c
+      HOME: /workspace/homes/agent-c
+      XDG_CACHE_HOME: /workspace/homes/agent-c/.cache
+      XDG_CONFIG_HOME: /workspace/homes/agent-c/.config
+      XDG_STATE_HOME: /workspace/homes/agent-c/.local/state
+
+  agent-d:
+    <<: *agent-base
+    working_dir: /workspace/worktrees/agent-d
+    environment:
+      <<: *common-env
+      AUTORESEARCH_AGENT_ID: agent-d
+      AUTORESEARCH_ROLE: D
+      AUTORESEARCH_PROGRAM_FILE: /workspace/program_agent_d.md
+      AUTORESEARCH_WORKTREE_DIR: /workspace/worktrees/agent-d
+      HOME: /workspace/homes/agent-d
+      XDG_CACHE_HOME: /workspace/homes/agent-d/.cache
+      XDG_CONFIG_HOME: /workspace/homes/agent-d/.config
+      XDG_STATE_HOME: /workspace/homes/agent-d/.local/state
+
+  agent-e:
+    <<: *agent-base
+    working_dir: /workspace/worktrees/agent-e
+    environment:
+      <<: *common-env
+      AUTORESEARCH_AGENT_ID: agent-e
+      AUTORESEARCH_ROLE: E
+      AUTORESEARCH_PROGRAM_FILE: /workspace/program_agent_e.md
+      AUTORESEARCH_WORKTREE_DIR: /workspace/worktrees/agent-e
+      HOME: /workspace/homes/agent-e
+      XDG_CACHE_HOME: /workspace/homes/agent-e/.cache
+      XDG_CONFIG_HOME: /workspace/homes/agent-e/.config
+      XDG_STATE_HOME: /workspace/homes/agent-e/.local/state
+
+  dashboard:
+    <<: *common-service
+    restart: unless-stopped
+    ports:
+      - "${DASHBOARD_PORT:-8080}:${DASHBOARD_PORT:-8080}"
+    command:
+      - bash
+      - -lc
+      - |
+          set -euo pipefail
+          port="$${DASHBOARD_PORT:-8080}"
+          if [ -f /workspace/dashboard_app.py ]; then
+            exec python3 -m uvicorn dashboard_app:app --host 0.0.0.0 --port "$$port"
+          fi
+          exec python3 -m http.server "$$port" --bind 0.0.0.0 --directory /workspace/shared
+    environment:
+      <<: *common-env
+      AUTORESEARCH_AGENT_ID: dashboard
+      AUTORESEARCH_ROLE: dashboard
+      HOME: /workspace/homes/dashboard
+      XDG_CACHE_HOME: /workspace/homes/dashboard/.cache
+      XDG_CONFIG_HOME: /workspace/homes/dashboard/.config
+      XDG_STATE_HOME: /workspace/homes/dashboard/.local/state

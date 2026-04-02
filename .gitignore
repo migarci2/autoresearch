@@ -9,20 +9,34 @@ wheels/
 # Virtual environments
 .venv
 worktrees/
+homes/
 results/
+runs/
 queue/
+shared/
+swarm_logs/
+runtime/
 
 # Agent prompt files (generated per-session by launchers)
 CLAUDE.md
 AGENTS.md
+program_agent_*.md
+
+# Environment files
+.env
+.env.secrets
+secrets/codex-vault/
+secrets/*.passphrase
 
 # Experimental code/artifacts
 dev/
+
+# Rendered deployment manifests
+runpod/*.rendered.json
 
 # Results file
 results.tsv
 
 # Collaboration
 .autoresearch-key
-uv.lock
 run.log

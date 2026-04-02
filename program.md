@@ -1,127 +1,101 @@
-# autoresearch
+# Local Autoresearch Loop
 
-This is an experiment to have the LLM do its own research.
+This repo runs a local Codex swarm for MNIST.
 
-## Setup
+The primary production runtime is a single RunPod Pod where a local supervisor launches all five agents plus the dashboard. Compose and host-only execution remain fallback modes.
 
-To set up a new experiment, work with the user to:
+## Objective
 
-1. **Check for GPU**: Run `nvidia-smi` to verify this machine has a CUDA-capable GPU. If the command fails or no GPU is found, stop setup and direct the human to this guide to get started with a cloud GPU: https://ensue.dev/blog/autoresearch-at-home/. Do not proceed until a GPU is available.
-2. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-3. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
-4. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `README.md` — repository context.
-   - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
-   - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-   - `collab.md` — **read this if collaborative mode is active** (see below). It has the full protocol for working with the swarm.
-5. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-6. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-7. **Confirm and go**: Confirm setup looks good.
+Minimize `val_errors` on the fixed 50k/10k split from the MNIST training set.
 
-Once you get confirmation, kick off the experimentation.
+Tie-breakers:
+1. lower `val_loss`
+2. lower `training_seconds`
 
-## Experimentation
+The MNIST test set is not for online search. Use it only when `RUN_MODE["final_eval"] = True` for frozen candidates.
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+## Files in scope
 
-**What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+- `config/swarm.yaml`: central operator config for agent models, role metadata and runtime defaults. Do not edit it during a search run unless the operator explicitly asks for a swarm-wide change.
+- `prepare.py`: fixed dataset preparation and evaluation helpers. Do not modify during search.
+- `train.py`: main search surface. Agents primarily modify config sections here.
+- `coordinator.py`: local claims, bests, shared log and GPU lease.
+- `collab.md`: shared-state protocol.
 
-**What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
+## Core loop
 
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+1. THINK
+   - Read `coord.analyze_swarm()`.
+   - Check `shared/best_results.json`.
+   - Inspect the most relevant failures and recent keeps.
+2. CLAIM
+   - `exp_key = coord.claim_experiment("short description")`
+   - If it returns `None`, choose another idea.
+3. EDIT
+   - Change only the config sections allowed by your role.
+4. RUN
+   - `uv run train.py > run.log 2>&1`
+   - `train.py` acquires and releases the GPU lease automatically.
+5. PARSE
+   - Read the final block from `run.log`.
+   - Extract at least `val_errors`, `val_accuracy`, `val_loss`, `train_loss`, `training_seconds`, `peak_vram_mb`, `run_mode`, `model_family`, `config_sha`.
+6. DECIDE
+   - `keep` if the run improves the relevant baseline by `val_errors` or ties on errors and improves `val_loss`.
+   - Otherwise `discard`.
+   - If the run crashes, publish `crash`.
+7. PUBLISH
+   - `coord.publish_result(...)`
+   - `coord.post_insight(...)`
+   - `coord.publish_hypothesis(...)`
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
+## Keep / discard policy
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
+- Primary metric: `val_errors`
+- Secondary metric: `val_loss`
+- Tertiary metric: `training_seconds`
 
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
+Do not keep a change just because test accuracy looked better. The test set is not the search objective.
 
-## Output format
+## Train output
 
-Once the script finishes it prints a summary like this:
+`train.py` prints a parseable summary block:
 
-```
+```text
 ---
-val_bpb:          0.997900
-training_seconds: 300.1
-total_seconds:    325.9
-peak_vram_mb:     45060.2
-mfu_percent:      39.80
-total_tokens_M:   499.6
-num_steps:        953
-num_params_M:     50.3
-depth:            8
+val_errors: 37
+val_accuracy: 0.996300
+val_loss: 0.011204
+train_loss: 0.008913
+training_seconds: 45.000000
+peak_vram_mb: 812.375000
+checkpoint_path: /abs/path/to/checkpoint.pt
+run_mode: single_model
+model_family: cnn
+config_sha: abc123def456
 ```
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
+Final evaluation may additionally include `test_errors` and `test_accuracy`.
 
-```
-grep "^val_bpb:\|^peak_vram_mb:\|^num_steps:\|^total_tokens_M:\|^mfu_percent:" run.log
-```
+## Publishing shape
 
-## Logging results
+Use a metrics dict like:
 
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
-
-The TSV has a header row and 5 columns:
-
-```
-commit	val_bpb	memory_gb	status	description
-```
-
-1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
-
-Example:
-
-```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	LR 0.001 → 0.04
-c3d4e5f	1.005000	44.0	discard	activation ReLU → GeLU
-d4e5f6g	0.000000	0.0	crash	hidden_dim 512 → 1024 (OOM)
+```python
+metrics = {
+    "val_errors": ...,
+    "val_accuracy": ...,
+    "val_loss": ...,
+    "train_loss": ...,
+    "training_seconds": ...,
+    "peak_vram_mb": ...,
+    "checkpoint_path": "...",
+    "config_path": "...",
+    "val_logits_path": "...",
+    "metadata_path": "...",
+    "config_sha": "...",
+    "run_mode": "...",
+    "model_family": "...",
+}
 ```
 
-## The experiment loop
-
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
-
-LOOP FOREVER:
-
-1. **THINK** — decide what to try next. This is the most important step. Don't skip it.
-   - In collaborative mode: run `coord.analyze_swarm()` to see the full state (including per-tier bests). Read swarm insights with `coord.get_swarm_insights("topic")`. Check `coord.get_unclaimed_hypotheses()` for ideas other agents proposed. Ask the swarm targeted questions with `coord.ask_swarm("question", namespace="results")`. Reason about what you see — what patterns emerge across agents' results, what's the biggest unknown, what would be highest-value to try next? Every 5 runs, `coord.pull_best_config_for_tier()` to adopt the best config for your VRAM tier (falls back to global best if none exists yet). **See the THINK section in `collab.md` for the full protocol and reasoning guidelines.**
-   - In solo mode: review your results.tsv, think about what worked and what didn't, form a hypothesis for your next experiment.
-2. **CLAIM** (collaborative only): `exp_key = coord.claim_experiment("description")`. If `None`, pick another idea. Up to 5 tries.
-3. Tune `train.py` with your experimental idea by directly hacking the code.
-4. git commit
-5. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-6. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:\|^num_steps:\|^total_tokens_M:\|^mfu_percent:" run.log`
-7. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-8. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-9. Decide keep or discard. In collaborative mode, compare against the **global best** (from `coord.analyze_swarm()` or `coord.pull_best_config()`) and your **tier best** (`coord.pull_best_config_for_tier()`), not just your local branch. If val_bpb improved, keep the git commit. If equal or worse, git reset back.
-10. **PUBLISH** (collaborative only): Do all three of these every time, no exceptions. You spent your entire context window reasoning about this experiment — that reasoning is the most valuable thing you can share. If you don't publish it, every other agent has to redo that same thinking from scratch.
-    - `coord.publish_result(exp_key, val_bpb, memory_gb, status, description, open("train.py").read(), extra_metrics={"num_steps": num_steps, "total_tokens_M": total_tokens_M, "mfu_percent": mfu_percent})`
-      Always extract and include `num_steps`, `total_tokens_M`, and `mfu_percent` from the run log. These are hardware-agnostic efficiency metrics that allow fair comparison across different GPUs.
-    - `coord.post_insight("what I observed and why", evidence_keys=[...])` — distill your deep reasoning into a clear insight. Explain *why*, not just what happened. Always post one, even on failures.
-    - `coord.publish_hypothesis(title, hypothesis, suggested_config, evidence_keys, priority)` — you've already done the hard thinking, so share the logical next experiment. Include your reasoning. This is mandatory — every experiment implies a next step, and another agent can run with it immediately instead of re-deriving what you already figured out.
-
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
-
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
-
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
-
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
-
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
-
-## Collaborative mode
-
-If `ENSUE_API_KEY` is set (or `.autoresearch-key` exists), you are part of a research swarm. Read `collab.md` for the full protocol. Pick a cool, memorable single-word codename for yourself (e.g. `nova`, `phoenix`, `atlas`) — NOT your Ensue org name, NOT anything with `autoresearch-` in it. Set it with `coord.agent_id = "phoenix"` and call `coord.announce()` at startup. If neither key exists, ignore this — solo mode works fine.
+Include `test_errors` and `test_accuracy` only for final evaluations.

@@ -1,1318 +1,911 @@
 """
-Collaborative autoresearch coordinator.
+Local filesystem coordinator for collaborative autoresearch on MNIST.
 
-Bridges the autoresearch experiment loop with the Ensue memory network,
-enabling SETI@home-style distributed research across multiple GPU participants.
-
-Uses `requests` (already in pyproject.toml) for JSON-RPC calls. Zero new deps.
-
-Usage:
-    from coordinator import Coordinator
-    coord = Coordinator()  # reads ENSUE_API_KEY or .autoresearch-key
-    coord.join_hub()
-    coord.claim_experiment("increase LR to 0.04")
-    coord.publish_result(exp_key, result_dict, open("train.py").read())
+This replaces the original Ensue-backed coordinator with a shared-directory
+implementation so multiple Codex agents can collaborate on a single machine.
 """
 
-import base64
+from __future__ import annotations
+
+import atexit
+import contextlib
 import hashlib
 import json
 import os
 import re
+import shutil
+import signal
+import socket
 import subprocess
 import time
+import threading
 from datetime import datetime, timezone
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Iterator, Optional
 
-import requests
+import fcntl
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-HUB_ORG = "autoresearch-at-home"
-API_URL = "https://api.ensue-network.ai/"
-KEY_FILE = ".autoresearch-key"
+DEFAULT_SHARED_DIR_ENV = "AUTORESEARCH_SHARED_DIR"
+DEFAULT_WORKSPACE_ENV = "AUTORESEARCH_WORKSPACE_ROOT"
+DEFAULT_AGENT_ENV = "AUTORESEARCH_AGENT_ID"
+DEFAULT_ROLE_ENV = "AUTORESEARCH_ROLE"
 
-CLAIM_TTL = 900              # 15 min soft expiry (3x expected 5-min experiment)
-VERIFY_DELAY = 2             # seconds between claim and verify
-SEMANTIC_THRESHOLD = 0.92    # block if active claim is this similar
-MAX_CLAIM_ATTEMPTS = 5       # alternatives before giving up
-SYNC_EVERY_N = 5             # pull global best every N experiments
+CLAIM_TTL_SECONDS = 30 * 60
+GPU_LOCK_STALE_SECONDS = 2 * 60 * 60
+GPU_HEARTBEAT_STALE_SECONDS = 2 * 60
+AGENT_HEARTBEAT_SECONDS = 15
+AGENT_STALE_SECONDS = 2 * 60
+SYNC_EVERY_N = 5
 
-# VRAM tier boundaries (upper bounds in GB, inclusive)
-VRAM_TIERS: dict[str, int] = {
-    "small": 16,     # ≤16 GB  (e.g. RTX 4070, RTX 3060, GTX 1080 Ti)
-    "medium": 24,    # ≤24 GB  (e.g. RTX 3090, RTX 4090)
-    "large": 48,     # ≤48 GB  (e.g. A6000, RTX A6000, L40)
-    "xl": 0,         # >48 GB  (e.g. A100, H100, H200) — 0 means no upper bound
-}
-# Sorted thresholds for tier classification (ascending)
-_TIER_THRESHOLDS: list[tuple[str, int]] = [
-    ("small", 16),
-    ("medium", 24),
-    ("large", 48),
-]
 
 # ---------------------------------------------------------------------------
-# Base JSON-RPC
+# Helpers
 # ---------------------------------------------------------------------------
-
-def _get_api_key() -> Optional[str]:
-    """Read API key from env var or key file."""
-    key = os.environ.get("ENSUE_API_KEY")
-    if key:
-        return key.strip()
-    if os.path.exists(KEY_FILE):
-        with open(KEY_FILE) as f:
-            return f.read().strip()
-    return None
-
-
-def ensue_rpc(api_key: str, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Make a JSON-RPC call to the Ensue MCP API."""
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "tools/call",
-        "params": {"name": tool_name, "arguments": arguments},
-        "id": 1,
-    }
-    resp = requests.post(
-        API_URL,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=30,
-    )
-    resp.raise_for_status()
-
-    # Response may have SSE "data: " prefix
-    text = resp.text.strip()
-    if text.startswith("data: "):
-        text = text[len("data: "):]
-
-    data = json.loads(text)
-
-    if "error" in data:
-        raise RuntimeError(f"RPC error: {data['error']}")
-
-    # Extract text content from result
-    result = data.get("result", {})
-    content = result.get("content", [])
-    if content and isinstance(content, list):
-        first = content[0]
-        if isinstance(first, dict) and "text" in first:
-            return json.loads(first["text"])
-    return result
-
-
-def _experiment_hash(description: str) -> str:
-    """Hash an experiment description for dedup keying."""
-    return hashlib.sha256(description.lower().strip().encode()).hexdigest()[:12]
-
-
-def detect_vram_gb() -> Optional[float]:
-    """Detect total VRAM of the current CUDA device in GB. Returns None if unavailable."""
-    try:
-        import torch
-        if torch.cuda.is_available():
-            return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-    except Exception:
-        pass
-    return None
-
-
-def get_vram_tier(vram_gb: float) -> str:
-    """Classify a VRAM size (in GB) into a tier name."""
-    for tier_name, threshold in _TIER_THRESHOLDS:
-        if vram_gb <= threshold:
-            return tier_name
-    return "xl"
-
-
-def _slugify(text: str, max_len: int = 40) -> str:
-    """Turn text into a URL-safe slug."""
-    slug = text.lower().strip()
-    slug = re.sub(r'[^a-z0-9]+', '-', slug)
-    slug = slug.strip('-')
-    return slug[:max_len].rstrip('-')
-
-
-def _experiment_key(agent_id: str, description: str) -> str:
-    """
-    Human-readable experiment key: <agent>--<slug>--<short_hash>
-
-    Example: gpu0--increase-lr-to-004--a7f3b2
-    """
-    slug = _slugify(description)
-    short_hash = _experiment_hash(description)[:6]
-    agent = _slugify(agent_id, max_len=20) or "unknown"
-    return f"{agent}--{slug}--{short_hash}"
-
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _git_remote_url() -> Optional[str]:
-    """Get the GitHub HTTPS URL for the current repo."""
+def _slugify(text: str, max_len: int = 48) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower().strip())
+    slug = slug.strip("-")
+    return slug[:max_len].rstrip("-") or "exp"
+
+
+def _normalize_description(text: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", text.lower()).split())
+
+
+def _description_hash(role: str, description: str) -> str:
+    base = f"{role.lower()}::{_normalize_description(description)}"
+    return hashlib.sha256(base.encode()).hexdigest()[:10]
+
+
+def _git_output(*args: str) -> Optional[str]:
     try:
-        url = subprocess.check_output(
-            ["git", "remote", "get-url", "origin"], text=True, stderr=subprocess.DEVNULL
-        ).strip()
-        # Convert SSH to HTTPS: git@github.com:user/repo.git -> https://github.com/user/repo
-        if url.startswith("git@github.com:"):
-            url = "https://github.com/" + url[len("git@github.com:"):]
-        if url.endswith(".git"):
-            url = url[:-4]
-        return url
+        return subprocess.check_output(args, text=True, stderr=subprocess.DEVNULL).strip()
     except Exception:
         return None
 
 
 def _git_branch() -> Optional[str]:
-    """Get the current git branch name."""
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True, stderr=subprocess.DEVNULL
-        ).strip()
-    except Exception:
-        return None
+    return _git_output("git", "branch", "--show-current")
 
 
 def _git_commit_short() -> Optional[str]:
-    """Get the short commit hash of HEAD."""
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"], text=True, stderr=subprocess.DEVNULL
-        ).strip()
-    except Exception:
+    return _git_output("git", "rev-parse", "--short", "HEAD")
+
+
+def _git_remote_url() -> Optional[str]:
+    url = _git_output("git", "remote", "get-url", "origin")
+    if not url:
         return None
+    if url.startswith("git@github.com:"):
+        url = "https://github.com/" + url[len("git@github.com:") :]
+    if url.endswith(".git"):
+        url = url[:-4]
+    return url
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _timestamp_age_seconds(timestamp: str | None) -> float | None:
+    if not timestamp:
+        return None
+    try:
+        return time.time() - datetime.fromisoformat(timestamp).timestamp()
+    except ValueError:
+        return None
+
+
+def _read_json(path: Path, default: Any = None) -> Any:
+    if not path.exists():
+        return default
+    with path.open() as handle:
+        return json.load(handle)
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(_json_safe(payload), indent=2, sort_keys=False) + "\n")
+    os.replace(tmp, path)
+
+
+def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        handle.write(json.dumps(_json_safe(payload), sort_keys=False) + "\n")
+
+
+def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows = []
+    with path.open() as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    return rows
+
+
+def _is_process_alive(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _record_sort_key(record: dict[str, Any]) -> tuple[float, float, float]:
+    metrics = record.get("metrics", {})
+    return (
+        float(metrics.get("val_errors", float("inf"))),
+        float(metrics.get("val_loss", float("inf"))),
+        float(metrics.get("training_seconds", float("inf"))),
+    )
+
+
+def _is_better(candidate: dict[str, Any], incumbent: Optional[dict[str, Any]]) -> bool:
+    if incumbent is None:
+        return True
+    return _record_sort_key(candidate) < _record_sort_key(incumbent)
+
+
+@contextlib.contextmanager
+def _locked_file(path: Path) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 # ---------------------------------------------------------------------------
 # Coordinator
 # ---------------------------------------------------------------------------
 
-class Coordinator:
-    """
-    Synchronous coordinator for collaborative autoresearch.
-
-    All methods catch exceptions and return gracefully so the training loop
-    never crashes due to network issues.
-    """
-
-    def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or _get_api_key()
-        self.agent_id: Optional[str] = None
+class LocalCoordinator:
+    def __init__(
+        self,
+        shared_dir: str | os.PathLike[str] | None = None,
+        workspace_root: str | os.PathLike[str] | None = None,
+        agent_id: str | None = None,
+        role: str | None = None,
+    ) -> None:
+        workspace_default = Path(os.environ.get(DEFAULT_WORKSPACE_ENV, str(Path.cwd())))
+        self.workspace_root = Path(workspace_root or workspace_default).resolve()
+        shared_default = Path(
+            os.environ.get(DEFAULT_SHARED_DIR_ENV, str(self.workspace_root / "shared"))
+        )
+        self.shared_dir = Path(shared_dir or shared_default).resolve()
+        self.agent_id = agent_id or os.environ.get(DEFAULT_AGENT_ENV, "local-agent")
+        self.role = role or os.environ.get(DEFAULT_ROLE_ENV, "solo")
         self.experiment_count = 0
-        # Auto-detect GPU VRAM and classify into a tier
-        self.vram_gb: Optional[float] = detect_vram_gb()
-        self.vram_tier: Optional[str] = get_vram_tier(self.vram_gb) if self.vram_gb is not None else None
 
-    def _log(self, msg: str) -> None:
-        """Print with agent identity prefix."""
-        tag = self.agent_id or "coordinator"
-        print(f"[{tag}] {msg}")
+        self.claims_dir = self.shared_dir / "claims"
+        self.locks_dir = self.shared_dir / "locks"
+        self.agents_dir = self.shared_dir / "agents"
+        self.snapshots_dir = self.shared_dir / "snapshots"
+        self.results_dir = self.shared_dir / "results"
+        self.best_checkpoints_dir = self.shared_dir / "best_checkpoints"
+        self.best_results_path = self.shared_dir / "best_results.json"
+        self.experiment_log_path = self.shared_dir / "experiment_log.jsonl"
+        self.insights_path = self.shared_dir / "insights.jsonl"
+        self.hypotheses_path = self.shared_dir / "hypotheses.jsonl"
+        self.state_lock_path = self.locks_dir / "state.lock"
+        self.gpu_lock_path = self.locks_dir / "gpu.lock"
+
+        for path in [
+            self.shared_dir,
+            self.claims_dir,
+            self.locks_dir,
+            self.agents_dir,
+            self.snapshots_dir,
+            self.results_dir,
+            self.best_checkpoints_dir,
+        ]:
+            path.mkdir(parents=True, exist_ok=True)
+
+        self.agent_status_path = self.agents_dir / (
+            f"{_slugify(self.role, max_len=12)}--{_slugify(self.agent_id, max_len=32)}.json"
+        )
+        self._status_lock = threading.Lock()
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
+        self._closed = False
+        self._status_state = "idle"
+        self._status_message = "ready"
+        self._status_since = _now_iso()
+        self._status_extra: dict[str, Any] = {}
+        self._owned_claims: set[str] = set()
+        self._holding_gpu_lease = False
+
+        self._write_agent_status()
+        self._start_heartbeat()
+        atexit.register(self.close)
 
     @property
     def connected(self) -> bool:
-        return self.api_key is not None
+        return True
 
-    def _rpc(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        """RPC call with the stored API key."""
-        if not self.api_key:
-            raise RuntimeError("No API key configured")
-        return ensue_rpc(self.api_key, tool_name, arguments)
+    def _log(self, message: str) -> None:
+        print(f"[{self.role}:{self.agent_id}] {message}")
 
     def _make_key(self, description: str) -> str:
-        """Create a human-readable experiment key using agent_id."""
-        return _experiment_key(self.agent_id or "unknown", description)
+        slug = _slugify(description)
+        digest = _description_hash(self.role, description)
+        role_slug = _slugify(self.role, max_len=12)
+        return f"{role_slug}--{slug}--{digest}"
 
-    # --- Onboarding ---
+    def _claim_path(self, experiment_key: str) -> Path:
+        return self.claims_dir / f"{experiment_key}.json"
 
-    def join_hub(self, invite_token: str) -> dict[str, Any]:
-        """Claim the hub invite to join autoresearch-community."""
-        try:
-            result = self._rpc("claim_invite", {"token": invite_token})
-            self._log(f"Joined hub: {result}")
-            return result
-        except Exception as e:
-            self._log(f"join_hub failed: {e}")
-            return {"error": str(e)}
+    def _load_best_results(self) -> dict[str, Any]:
+        return _read_json(
+            self.best_results_path,
+            default={"global_best": None, "by_role": {}, "by_family": {}, "updated_at": None},
+        )
 
-    def test_connectivity(self) -> bool:
-        """Test if the API key works."""
-        try:
-            self._rpc("list_keys", {"limit": 1})
-            return True
-        except Exception:
-            return False
+    def _save_best_results(self, payload: dict[str, Any]) -> None:
+        payload["updated_at"] = _now_iso()
+        _write_json(self.best_results_path, payload)
 
     def announce(self) -> None:
-        """Print a startup banner with swarm state."""
-        try:
-            tag = self.agent_id or "unknown"
-            # Get global best
-            meta_key = f"@{HUB_ORG}/best/metadata"
-            meta = self._rpc("get_memory", {"key_names": [meta_key]})
-            meta_results = meta.get("results", [])
-            best_line = "no results yet"
-            if meta_results and meta_results[0].get("status") == "success":
-                current = json.loads(meta_results[0].get("value", "{}"))
-                best_bpb = current.get("val_bpb", "?")
-                best_by = current.get("agent_id", "?")
-                best_line = f"val_bpb={best_bpb} (by {best_by})"
+        analysis = self.analyze_swarm()
+        print(analysis["summary"])
 
-            # Count results
-            result_list = self._rpc("list_keys", {
-                "prefix": f"@{HUB_ORG}/results/",
-                "limit": 200,
-            })
-            result_keys = result_list.get("keys", [])
-            total = len(result_keys)
+    def _status_payload(self) -> dict[str, Any]:
+        with self._status_lock:
+            payload = {
+                "agent_id": self.agent_id,
+                "role": self.role,
+                "pid": os.getpid(),
+                "hostname": socket.gethostname(),
+                "workspace_root": str(self.workspace_root),
+                "shared_dir": str(self.shared_dir),
+                "state": self._status_state,
+                "message": self._status_message,
+                "state_since": self._status_since,
+                "last_seen_at": _now_iso(),
+                "claims_count": len(self._owned_claims),
+                "claim_keys": sorted(self._owned_claims),
+                "gpu_lease_held": self._holding_gpu_lease,
+                "extra": _json_safe(dict(self._status_extra)),
+            }
+        return payload
 
-            # Count active claims
-            claim_list = self._rpc("list_keys", {
-                "prefix": f"@{HUB_ORG}/claims/",
-                "limit": 50,
-            })
-            active_claims = len(claim_list.get("keys", []))
+    def _write_agent_status(self) -> dict[str, Any]:
+        payload = self._status_payload()
+        _write_json(self.agent_status_path, payload)
+        return payload
 
-            # VRAM tier info
-            vram_line = "unknown"
-            if self.vram_gb is not None:
-                vram_line = f"{self.vram_gb:.1f} GB ({self.vram_tier})"
+    def touch_agent_status(
+        self,
+        state: str | None = None,
+        message: str | None = None,
+        extra: dict[str, Any] | None = None,
+        *,
+        replace_extra: bool = False,
+        drop_extra_keys: list[str] | None = None,
+    ) -> dict[str, Any]:
+        with self._status_lock:
+            if state and state != self._status_state:
+                self._status_state = state
+                self._status_since = _now_iso()
+            if message is not None:
+                self._status_message = message
+            if replace_extra:
+                self._status_extra = {}
+            for key in drop_extra_keys or []:
+                self._status_extra.pop(key, None)
+            if extra:
+                self._status_extra.update(_json_safe(extra))
+        return self._write_agent_status()
 
-            banner = f"""
-{'=' * 54}
-  AUTORESEARCH AGENT: {tag}
-  Swarm: {HUB_ORG}
-  VRAM: {vram_line}
-  Global best: {best_line}
-  Experiments completed: {total}
-  Active claims: {active_claims}
-{'=' * 54}"""
-            print(banner)
-        except Exception as e:
-            self._log(f"announce error (non-fatal): {e}")
-            print(f"\n  AUTORESEARCH AGENT: {self.agent_id or 'unknown'}\n")
+    def _refresh_claim_heartbeats(self) -> None:
+        now = _now_iso()
+        with self._status_lock:
+            owned = list(self._owned_claims)
+        if not owned:
+            return
+        with _locked_file(self.state_lock_path):
+            for experiment_key in owned:
+                claim_path = self._claim_path(experiment_key)
+                payload = _read_json(claim_path, default={})
+                if payload.get("agent_id") != self.agent_id:
+                    with self._status_lock:
+                        self._owned_claims.discard(experiment_key)
+                    continue
+                payload["heartbeat_at"] = now
+                payload["pid"] = os.getpid()
+                payload["hostname"] = socket.gethostname()
+                _write_json(claim_path, payload)
 
-    # --- Work Claiming ---
+    def _refresh_gpu_heartbeat(self) -> None:
+        with self._status_lock:
+            holding_gpu_lease = self._holding_gpu_lease
+        if not holding_gpu_lease:
+            return
+        with _locked_file(self.state_lock_path):
+            payload = _read_json(self.gpu_lock_path, default={})
+            if payload.get("agent_id") != self.agent_id or payload.get("role") != self.role:
+                with self._status_lock:
+                    self._holding_gpu_lease = False
+                return
+            payload["heartbeat_at"] = _now_iso()
+            payload["pid"] = os.getpid()
+            payload["hostname"] = socket.gethostname()
+            _write_json(self.gpu_lock_path, payload)
+
+    def _heartbeat_loop(self) -> None:
+        while not self._heartbeat_stop.wait(AGENT_HEARTBEAT_SECONDS):
+            try:
+                self._refresh_claim_heartbeats()
+                self._refresh_gpu_heartbeat()
+                self._write_agent_status()
+            except Exception:
+                # Heartbeats must never crash the main experiment loop.
+                pass
+
+    def _start_heartbeat(self) -> None:
+        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+            return
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name=f"coord-heartbeat-{self.agent_id}",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._heartbeat_stop.set()
+        thread = self._heartbeat_thread
+        if thread and thread.is_alive() and thread.ident != threading.get_ident():
+            thread.join(timeout=1.0)
+        self.touch_agent_status(
+            state="stopped",
+            message="process exited",
+            extra={"stopped_at": _now_iso()},
+        )
+
+    # ------------------------------------------------------------------
+    # Claiming
+    # ------------------------------------------------------------------
+
+    def _claim_payload(self, experiment_key: str, description: str) -> dict[str, Any]:
+        now = _now_iso()
+        return {
+            "experiment_key": experiment_key,
+            "description": description,
+            "normalized_description": _normalize_description(description),
+            "agent_id": self.agent_id,
+            "role": self.role,
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "claimed_at": now,
+            "heartbeat_at": now,
+            "ttl_seconds": CLAIM_TTL_SECONDS,
+        }
+
+    def _is_claim_stale(self, payload: dict[str, Any]) -> bool:
+        claimed_at = payload.get("heartbeat_at") or payload.get("claimed_at")
+        pid = payload.get("pid")
+        age = _timestamp_age_seconds(claimed_at)
+        if age is None:
+            return True
+        if age > payload.get("ttl_seconds", CLAIM_TTL_SECONDS):
+            return True
+        if payload.get("hostname") == socket.gethostname():
+            return not _is_process_alive(pid)
+        return False
 
     def check_claimed(self, experiment_key: str) -> bool:
-        """Check if an experiment is already claimed (active) or completed."""
-        try:
-            # Check if result already exists (try new key format)
-            result_key = f"@{HUB_ORG}/results/{experiment_key}"
-            result = self._rpc("get_memory", {"key_names": [result_key]})
-            results = result.get("results", [])
-            if results and results[0].get("status") == "success":
-                return True  # already done
-
-            # Fallback: check old hash-only format if key contains '--'
-            if "--" in experiment_key:
-                old_hash = experiment_key.rsplit("--", 1)[-1]
-                if len(old_hash) <= 12:
-                    old_result_key = f"@{HUB_ORG}/results/{old_hash}"
-                    old_result = self._rpc("get_memory", {"key_names": [old_result_key]})
-                    old_results = old_result.get("results", [])
-                    if old_results and old_results[0].get("status") == "success":
-                        return True
-
-            # Check for active claim
-            claim_key = f"@{HUB_ORG}/claims/{experiment_key}"
-            claim = self._rpc("get_memory", {"key_names": [claim_key]})
-            claims = claim.get("results", [])
-            if claims and claims[0].get("status") == "success":
-                value = json.loads(claims[0].get("value", "{}"))
-                claimed_at = value.get("claimed_at", "")
-                # Check if claim is stale (> CLAIM_TTL seconds old)
-                if claimed_at:
-                    try:
-                        claimed_time = datetime.fromisoformat(claimed_at)
-                        age = (datetime.now(timezone.utc) - claimed_time).total_seconds()
-                        if age < CLAIM_TTL:
-                            return True  # fresh claim, someone's on it
-                    except (ValueError, TypeError):
-                        pass
+        claim_path = self._claim_path(experiment_key)
+        if not claim_path.exists():
             return False
-        except Exception as e:
-            self._log(f"check_claimed error: {e}")
-            return False  # assume not claimed on error, let training proceed
-
-    def check_similar_claimed(self, description: str) -> list[dict]:
-        """Semantic search for similar in-progress work."""
-        try:
-            result = self._rpc("search_memories", {
-                "query": description,
-                "limit": 5,
-                "prefix": f"@{HUB_ORG}/claims/",
-            })
-            matches = result.get("results", [])
-            # Filter to fresh claims above threshold
-            similar = []
-            for match in matches:
-                score = match.get("score", 0)
-                if score < SEMANTIC_THRESHOLD:
-                    continue
-                value = json.loads(match.get("value", "{}"))
-                claimed_at = value.get("claimed_at", "")
-                if claimed_at:
-                    try:
-                        claimed_time = datetime.fromisoformat(claimed_at)
-                        age = (datetime.now(timezone.utc) - claimed_time).total_seconds()
-                        if age < CLAIM_TTL:
-                            similar.append({"description": value.get("description", ""), "score": score, "agent": value.get("agent_id", "")})
-                    except (ValueError, TypeError):
-                        pass
-            return similar
-        except Exception as e:
-            self._log(f"check_similar_claimed error: {e}")
-            return []
+        payload = _read_json(claim_path, default={})
+        if self._is_claim_stale(payload):
+            try:
+                claim_path.unlink()
+            except FileNotFoundError:
+                pass
+            return False
+        return True
 
     def claim_experiment(self, description: str) -> Optional[str]:
-        """
-        Attempt to claim an experiment. Returns the experiment key if claimed,
-        or None if already taken / similar work in progress.
+        experiment_key = self._make_key(description)
+        claim_path = self._claim_path(experiment_key)
+        with _locked_file(self.state_lock_path):
+            if claim_path.exists():
+                payload = _read_json(claim_path, default={})
+                if not self._is_claim_stale(payload):
+                    self._log(f"Experiment already claimed: {experiment_key}")
+                    return None
+                claim_path.unlink(missing_ok=True)
 
-        The key is human-readable: <agent>--<slug>--<short_hash>
-        """
-        exp_key = self._make_key(description)
+            payload = self._claim_payload(experiment_key, description)
+            _write_json(claim_path, payload)
+            with self._status_lock:
+                self._owned_claims.add(experiment_key)
+        self._log(f"Claimed experiment: {experiment_key}")
+        self.touch_agent_status(
+            state="planning",
+            message=f"claimed {experiment_key}",
+            extra={
+                "current_experiment_key": experiment_key,
+                "current_description": description,
+            },
+        )
+        return experiment_key
 
-        try:
-            # 1. CHECK exact
-            if self.check_claimed(exp_key):
-                self._log(f"Experiment already claimed/completed: {exp_key}")
-                return None
+    def release_claim(self, experiment_key: str) -> None:
+        claim_path = self._claim_path(experiment_key)
+        with _locked_file(self.state_lock_path):
+            payload = _read_json(claim_path, default={})
+            if payload.get("agent_id") == self.agent_id:
+                claim_path.unlink(missing_ok=True)
+                with self._status_lock:
+                    self._owned_claims.discard(experiment_key)
+        self.touch_agent_status(
+            state="idle",
+            message="ready",
+            drop_extra_keys=["current_experiment_key", "current_description"],
+        )
 
-            # 2. CHECK semantic
-            similar = self.check_similar_claimed(description)
-            if similar:
-                self._log(f"Similar work in progress: {similar[0]['description']} (score={similar[0]['score']:.3f} by {similar[0]['agent']})")
-                return None
+    # ------------------------------------------------------------------
+    # GPU lease
+    # ------------------------------------------------------------------
 
-            # 3. CLAIM
-            claim_key = f"@{HUB_ORG}/claims/{exp_key}"
-            claim_data = {
-                "agent_id": self.agent_id or "unknown",
-                "description": description,
-                "experiment_key": exp_key,
-                "claimed_at": _now_iso(),
-                "expected_duration_seconds": 300,
-                "status": "claimed",
-            }
-            value_b64 = base64.b64encode(json.dumps(claim_data).encode()).decode()
-            self._rpc("create_memory", {"items": [{
-                "key_name": claim_key,
-                "description": f"[autoresearch] Claim: {description}",
-                "value": value_b64,
-                "base64": True,
-                "embed": True,
-                "embed_source": "description",
-            }]})
+    def _gpu_lock_payload(self) -> dict[str, Any]:
+        now = _now_iso()
+        return {
+            "agent_id": self.agent_id,
+            "role": self.role,
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "acquired_at": now,
+            "heartbeat_at": now,
+        }
 
-            # 4. VERIFY (wait for race resolution)
-            time.sleep(VERIFY_DELAY)
-            verify = self._rpc("get_memory", {"key_names": [claim_key]})
-            verify_results = verify.get("results", [])
-            if verify_results and verify_results[0].get("status") == "success":
-                value = json.loads(verify_results[0].get("value", "{}"))
-                if value.get("agent_id") == (self.agent_id or "unknown"):
-                    self._log(f"Claimed experiment: {exp_key}")
-                    return exp_key
+    def _gpu_lock_is_stale(self) -> bool:
+        payload = _read_json(self.gpu_lock_path, default={})
+        if not payload:
+            return False
+        heartbeat_age = _timestamp_age_seconds(payload.get("heartbeat_at") or payload.get("acquired_at"))
+        acquired_age = _timestamp_age_seconds(payload.get("acquired_at"))
+        if heartbeat_age is None or acquired_age is None:
+            return True
+        if heartbeat_age > GPU_HEARTBEAT_STALE_SECONDS or acquired_age > GPU_LOCK_STALE_SECONDS:
+            return True
+        if payload.get("hostname") == socket.gethostname():
+            return not _is_process_alive(payload.get("pid"))
+        return False
 
-            self._log(f"Lost claim race for: {exp_key}")
-            return None
+    @contextlib.contextmanager
+    def gpu_lease(self, poll_interval: float = 5.0, timeout: float | None = None) -> Iterator[dict[str, Any]]:
+        start = time.time()
+        self.touch_agent_status(state="waiting_for_gpu", message="waiting for shared GPU lease")
+        while True:
+            with _locked_file(self.state_lock_path):
+                if self.gpu_lock_path.exists() and self._gpu_lock_is_stale():
+                    self.gpu_lock_path.unlink(missing_ok=True)
 
-        except Exception as e:
-            self._log(f"claim_experiment error: {e}")
-            # On error, return the key anyway so training can proceed locally
-            return exp_key
+                if not self.gpu_lock_path.exists():
+                    payload = self._gpu_lock_payload()
+                    _write_json(self.gpu_lock_path, payload)
+                    with self._status_lock:
+                        self._holding_gpu_lease = True
+                    self._log("Acquired GPU lease")
+                    self.touch_agent_status(state="running", message="holding shared GPU lease")
+                    try:
+                        yield payload
+                    finally:
+                        with _locked_file(self.state_lock_path):
+                            current = _read_json(self.gpu_lock_path, default={})
+                            if current.get("pid") == os.getpid() and current.get("agent_id") == self.agent_id:
+                                self.gpu_lock_path.unlink(missing_ok=True)
+                                self._log("Released GPU lease")
+                        with self._status_lock:
+                            self._holding_gpu_lease = False
+                        self.touch_agent_status(state="idle", message="ready")
+                    return
 
-    # --- Results ---
+            if timeout is not None and time.time() - start > timeout:
+                raise TimeoutError("Timed out waiting for the shared GPU lease")
+            time.sleep(poll_interval)
+
+    # ------------------------------------------------------------------
+    # Results
+    # ------------------------------------------------------------------
 
     def publish_result(
         self,
         experiment_key: str,
-        val_bpb: float,
-        memory_gb: float,
+        metrics: dict[str, Any],
         status: str,
         description: str,
         train_py_source: str,
-        extra_metrics: Optional[dict] = None,
-    ) -> None:
-        """Publish an experiment result to the hub with full train.py source."""
-        try:
-            repo_url = _git_remote_url()
-            branch = _git_branch()
-            commit = _git_commit_short()
+        artifacts_dir: str | os.PathLike[str] | None = None,
+        final_eval: bool = False,
+    ) -> dict[str, Any]:
+        metrics = _json_safe(dict(metrics))
+        snapshot_dir = self.snapshots_dir / experiment_key
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        train_snapshot_path = snapshot_dir / "train.py"
+        train_snapshot_path.write_text(train_py_source)
 
-            # Get current global best and personal best for delta calculations
-            global_best_bpb = self._get_global_best_bpb()
-            delta_vs_best = val_bpb - global_best_bpb if global_best_bpb is not None else None
-            agent_best_bpb = self._get_agent_best_bpb()
-            delta_vs_own_best = val_bpb - agent_best_bpb if agent_best_bpb is not None else None
+        local_artifacts_dir = Path(artifacts_dir).resolve() if artifacts_dir else None
+        shared_artifact_dir = None
+        if status == "keep" and local_artifacts_dir and local_artifacts_dir.exists():
+            shared_artifact_dir = self.best_checkpoints_dir / experiment_key
+            if shared_artifact_dir.exists():
+                shutil.rmtree(shared_artifact_dir)
+            shutil.copytree(local_artifacts_dir, shared_artifact_dir)
+            for key in ["checkpoint_path", "val_logits_path", "metadata_path", "config_path", "manifest_path"]:
+                if metrics.get(key):
+                    path = Path(metrics[key])
+                    if path.exists():
+                        metrics[key] = str(shared_artifact_dir / path.name)
 
-            result_data = {
-                "agent_id": self.agent_id or "unknown",
-                "val_bpb": val_bpb,
-                "memory_gb": memory_gb,
-                "vram_tier": self.vram_tier,
-                "vram_total_gb": round(self.vram_gb, 1) if self.vram_gb is not None else None,
-                "status": status,
-                "commit": commit,
-                "description": description,
-                "train_py": train_py_source,
-                "repo_url": repo_url,
-                "branch": branch,
-                "commit_url": f"{repo_url}/commit/{commit}" if repo_url and commit else None,
-                "completed_at": _now_iso(),
-                "delta_vs_best": delta_vs_best,
-                "global_best_at_publish": global_best_bpb,
-                "delta_vs_own_best": delta_vs_own_best,
-                "agent_best_at_publish": agent_best_bpb,
-                **(extra_metrics or {}),
-            }
+        record = {
+            "experiment_key": experiment_key,
+            "agent_id": self.agent_id,
+            "role": self.role,
+            "status": status,
+            "description": description,
+            "workspace_root": str(self.workspace_root),
+            "branch": _git_branch(),
+            "commit": _git_commit_short(),
+            "repo_url": _git_remote_url(),
+            "recorded_at": _now_iso(),
+            "train_py_path": str(train_snapshot_path),
+            "artifacts_dir": str(local_artifacts_dir) if local_artifacts_dir else None,
+            "shared_artifact_dir": str(shared_artifact_dir) if shared_artifact_dir else None,
+            "final_eval": bool(final_eval),
+            "metrics": metrics,
+        }
 
-            result_key = f"@{HUB_ORG}/results/{experiment_key}"
-            value_b64 = base64.b64encode(json.dumps(result_data).encode()).decode()
+        with _locked_file(self.state_lock_path):
+            _append_jsonl(self.experiment_log_path, record)
+            _write_json(self.results_dir / f"{experiment_key}.json", record)
+            bests = self._load_best_results()
 
-            agent = self.agent_id or "unknown"
-            desc_prefix = f"[{agent} {status.upper()}] val_bpb={val_bpb:.6f}"
-            if delta_vs_best is not None:
-                desc_prefix += f" (delta={delta_vs_best:+.4f})"
-            desc_prefix += f" | {description}"
-
-            self._rpc("create_memory", {"items": [{
-                "key_name": result_key,
-                "description": f"[autoresearch] Result: {desc_prefix}",
-                "value": value_b64,
-                "base64": True,
-                "embed": True,
-                "embed_source": "description",
-            }]})
-
-            # Print with explicit metrics
-            delta_str = ""
-            if delta_vs_best is not None:
-                delta_str = f" (delta={delta_vs_best:+.4f} vs global best {global_best_bpb:.6f})"
-            self._log(f"RESULT: val_bpb={val_bpb:.6f}{delta_str} ({status})")
-
-            # Update bests if this is a keep
             if status == "keep":
-                self._update_agent_best(val_bpb, result_data)
-                self.maybe_update_best(val_bpb, result_data, train_py_source)
-                if self.vram_tier:
-                    self._update_tier_best(val_bpb, result_data, train_py_source)
+                if _is_better(record, bests.get("global_best")):
+                    bests["global_best"] = record
 
-        except Exception as e:
-            self._log(f"publish_result error: {e}")
+                role_best = bests.setdefault("by_role", {}).get(self.role)
+                if _is_better(record, role_best):
+                    bests["by_role"][self.role] = record
 
-    def _get_global_best_bpb(self) -> Optional[float]:
-        """Read the current global best val_bpb. Returns None if unavailable."""
-        try:
-            meta_key = f"@{HUB_ORG}/best/metadata"
-            meta = self._rpc("get_memory", {"key_names": [meta_key]})
-            meta_results = meta.get("results", [])
-            if meta_results and meta_results[0].get("status") == "success":
-                current = json.loads(meta_results[0].get("value", "{}"))
-                return current.get("val_bpb")
-        except Exception:
-            pass
-        return None
+                family = str(metrics.get("model_family", "unknown"))
+                family_best = bests.setdefault("by_family", {}).get(family)
+                if _is_better(record, family_best):
+                    bests["by_family"][family] = record
 
-    def _get_agent_best_bpb(self, agent_id: str = None) -> Optional[float]:
-        """Read an agent's personal best val_bpb. Returns None if unavailable."""
-        agent = agent_id or self.agent_id or "unknown"
-        try:
-            key = f"@{HUB_ORG}/best/agent/{agent}"
-            result = self._rpc("get_memory", {"key_names": [key]})
-            results = result.get("results", [])
-            if results and results[0].get("status") == "success":
-                data = json.loads(results[0].get("value", "{}"))
-                return data.get("val_bpb")
-        except Exception:
-            pass
-        return None
+                self._save_best_results(bests)
 
-    def _update_agent_best(self, val_bpb: float, result_data: dict) -> None:
-        """Update this agent's personal best if this result beats it."""
-        agent = self.agent_id or "unknown"
-        try:
-            key = f"@{HUB_ORG}/best/agent/{agent}"
-            current = self._get_agent_best_bpb()
+            claim_path = self._claim_path(experiment_key)
+            if claim_path.exists():
+                claim_payload = _read_json(claim_path, default={})
+                if claim_payload.get("agent_id") == self.agent_id:
+                    claim_path.unlink(missing_ok=True)
+                    with self._status_lock:
+                        self._owned_claims.discard(experiment_key)
 
-            if current is not None and val_bpb >= current:
-                return  # not better
+        self._log(
+            "Published result "
+            f"{experiment_key}: status={status} val_errors={metrics.get('val_errors')} val_loss={metrics.get('val_loss')}"
+        )
+        self.touch_agent_status(
+            state="idle",
+            message=f"last result: {status}",
+            extra={
+                "last_result": {
+                    "experiment_key": experiment_key,
+                    "status": status,
+                    "val_errors": metrics.get("val_errors"),
+                    "val_loss": metrics.get("val_loss"),
+                    "model_family": metrics.get("model_family"),
+                    "run_mode": metrics.get("run_mode"),
+                    "recorded_at": record["recorded_at"],
+                    "final_eval": bool(final_eval),
+                }
+            },
+            drop_extra_keys=["current_experiment_key", "current_description"],
+        )
+        return record
 
-            best_data = {
-                "agent_id": agent,
-                "val_bpb": val_bpb,
-                "description": result_data.get("description"),
-                "memory_gb": result_data.get("memory_gb"),
-                "vram_tier": self.vram_tier,
-                "vram_total_gb": round(self.vram_gb, 1) if self.vram_gb is not None else None,
-                "achieved_at": _now_iso(),
-                "previous_best_val_bpb": current,
-            }
-            value_b64 = base64.b64encode(json.dumps(best_data).encode()).decode()
-            try:
-                self._rpc("update_memory", {
-                    "key_name": key,
-                    "value": value_b64,
-                    "base64": True,
-                })
-            except Exception:
-                self._rpc("create_memory", {"items": [{
-                    "key_name": key,
-                    "description": f"[autoresearch] Personal best for {agent}: val_bpb={val_bpb:.6f}",
-                    "value": value_b64,
-                    "base64": True,
-                }]})
-
-            improvement = (current - val_bpb) if current else 0
-            self._log(f"New personal best! val_bpb={val_bpb:.6f} (improved {improvement:.4f})")
-
-        except Exception as e:
-            self._log(f"_update_agent_best error: {e}")
-
-    def get_all_agent_bests(self) -> list[dict]:
-        """Get every agent's personal best. Useful for seeing which strategies work across different hardware."""
-        try:
-            result = self._rpc("list_keys", {
-                "prefix": f"@{HUB_ORG}/best/agent/",
-                "limit": 50,
-            })
-            keys = result.get("keys", [])
-            key_names = []
-            for k in keys:
-                name = k.get("key_name", k) if isinstance(k, dict) else k
-                key_names.append(f"@{HUB_ORG}/{name}")
-
-            if not key_names:
-                return []
-
-            bests = []
-            for kn in key_names:
-                try:
-                    r = self._rpc("get_memory", {"key_names": [kn]})
-                    results = r.get("results", [])
-                    if results and results[0].get("status") == "success":
-                        data = json.loads(results[0].get("value", "{}"))
-                        bests.append(data)
-                except Exception:
-                    pass
-
-            return sorted(bests, key=lambda x: x.get("val_bpb", float("inf")))
-
-        except Exception as e:
-            self._log(f"get_all_agent_bests error: {e}")
-            return []
-
-    # --- VRAM Tier Bests ---
-
-    def _get_tier_best_bpb(self, tier: str) -> Optional[float]:
-        """Read the current best val_bpb for a VRAM tier. Returns None if unavailable."""
-        try:
-            key = f"@{HUB_ORG}/best/tier/{tier}/metadata"
-            result = self._rpc("get_memory", {"key_names": [key]})
-            results = result.get("results", [])
-            if results and results[0].get("status") == "success":
-                data = json.loads(results[0].get("value", "{}"))
-                return data.get("val_bpb")
-        except Exception:
-            pass
-        return None
-
-    def _update_tier_best(self, val_bpb: float, result_data: dict, train_py_source: str) -> bool:
-        """Update the best config for this agent's VRAM tier if the result beats it. Returns True if updated."""
-        tier = self.vram_tier
-        if not tier:
-            return False
-        try:
-            # Sanity: same rules as global best
-            if val_bpb <= 0:
-                return False
-            if val_bpb < 0.5:
-                return False
-
-            meta_key = f"@{HUB_ORG}/best/tier/{tier}/metadata"
-            code_key = f"@{HUB_ORG}/best/tier/{tier}/train_py"
-
-            current_bpb = self._get_tier_best_bpb(tier)
-            if current_bpb is not None and val_bpb >= current_bpb:
-                return False  # not better
-
-            previous_best_bpb = current_bpb
-            previous_best_by = None
-            if current_bpb is not None:
-                # Read full metadata for previous best info
-                meta = self._rpc("get_memory", {"key_names": [meta_key]})
-                meta_results = meta.get("results", [])
-                if meta_results and meta_results[0].get("status") == "success":
-                    prev = json.loads(meta_results[0].get("value", "{}"))
-                    previous_best_by = prev.get("agent_id")
-
-            tier_data = {
-                **{k: v for k, v in result_data.items() if k != "train_py"},
-                "vram_tier": tier,
-                "best_val_bpb": val_bpb,
-                "achieved_by": self.agent_id or "unknown",
-                "achieved_at": _now_iso(),
-                "previous_best_val_bpb": previous_best_bpb,
-                "previous_best_by": previous_best_by,
-            }
-
-            # Upsert tier train_py
-            code_b64 = base64.b64encode(train_py_source.encode()).decode()
-            try:
-                self._rpc("update_memory", {
-                    "key_name": code_key,
-                    "value": code_b64,
-                    "base64": True,
-                })
-            except Exception:
-                self._rpc("create_memory", {"items": [{
-                    "key_name": code_key,
-                    "description": f"[autoresearch] Best train.py for VRAM tier '{tier}'",
-                    "value": code_b64,
-                    "base64": True,
-                }]})
-
-            # Upsert tier metadata
-            meta_b64 = base64.b64encode(json.dumps(tier_data).encode()).decode()
-            try:
-                self._rpc("update_memory", {
-                    "key_name": meta_key,
-                    "value": meta_b64,
-                    "base64": True,
-                })
-            except Exception:
-                self._rpc("create_memory", {"items": [{
-                    "key_name": meta_key,
-                    "description": f"[autoresearch] Metadata for best train.py in VRAM tier '{tier}'",
-                    "value": meta_b64,
-                    "base64": True,
-                }]})
-
-            improvement = (previous_best_bpb - val_bpb) if previous_best_bpb is not None else 0
-            self._log(f"NEW TIER BEST ({tier})! val_bpb={val_bpb:.6f} (improved {improvement:.4f})")
-            return True
-
-        except Exception as e:
-            self._log(f"_update_tier_best error: {e}")
-            return False
-
-    def get_tier_best(self, tier: str) -> Optional[dict]:
-        """Get the best result metadata for a specific VRAM tier."""
-        try:
-            key = f"@{HUB_ORG}/best/tier/{tier}/metadata"
-            result = self._rpc("get_memory", {"key_names": [key]})
-            results = result.get("results", [])
-            if results and results[0].get("status") == "success":
-                return json.loads(results[0].get("value", "{}"))
-        except Exception as e:
-            self._log(f"get_tier_best error: {e}")
-        return None
-
-    def get_all_tier_bests(self) -> dict[str, Optional[dict]]:
-        """Get the best result for every VRAM tier. Returns {tier_name: metadata_dict_or_None}."""
-        tier_bests: dict[str, Optional[dict]] = {}
-        for tier_name in VRAM_TIERS:
-            tier_bests[tier_name] = self.get_tier_best(tier_name)
-        return tier_bests
-
-    def pull_best_config_for_tier(self, tier: Optional[str] = None) -> Optional[tuple[str, dict]]:
-        """
-        Pull the best train.py and metadata for the given VRAM tier.
-        Falls back to the global best if no tier-specific best exists.
-        If tier is None, uses this agent's auto-detected tier.
-        Returns (source_code, metadata_dict) or None.
-        """
-        tier = tier or self.vram_tier
-        if tier:
-            try:
-                meta_key = f"@{HUB_ORG}/best/tier/{tier}/metadata"
-                code_key = f"@{HUB_ORG}/best/tier/{tier}/train_py"
-
-                meta = self._rpc("get_memory", {"key_names": [meta_key]})
-                meta_results = meta.get("results", [])
-                if meta_results and meta_results[0].get("status") == "success":
-                    code = self._rpc("get_memory", {"key_names": [code_key]})
-                    code_results = code.get("results", [])
-                    if code_results and code_results[0].get("status") == "success":
-                        metadata = json.loads(meta_results[0]["value"])
-                        source = code_results[0]["value"]
-                        self._log(f"Pulled tier '{tier}' best: val_bpb={metadata.get('val_bpb', '?')} (by {metadata.get('agent_id', '?')})")
-                        return source, metadata
-                self._log(f"No tier-specific best for '{tier}', falling back to global best")
-            except Exception as e:
-                self._log(f"pull_best_config_for_tier error (falling back to global): {e}")
-
-        # Fall back to global best
-        return self.pull_best_config()
-
-    def maybe_update_best(
+    def get_ranked_results(
         self,
-        val_bpb: float,
-        result_data: dict,
-        train_py_source: str,
-    ) -> bool:
-        """
-        Update the global best if this result beats it. Returns True if updated.
+        limit: int | None = None,
+        *,
+        status: str | None = "keep",
+        run_mode: str | None = None,
+        families: list[str] | None = None,
+        roles: list[str] | None = None,
+        final_eval: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        rows = _load_jsonl(self.experiment_log_path)
+        filtered = []
+        family_set = set(families or [])
+        role_set = set(roles or [])
+        for row in rows:
+            metrics = row.get("metrics", {})
+            if status and row.get("status") != status:
+                continue
+            if run_mode and metrics.get("run_mode") != run_mode:
+                continue
+            if family_set and metrics.get("model_family") not in family_set:
+                continue
+            if role_set and row.get("role") not in role_set:
+                continue
+            if final_eval is not None and bool(row.get("final_eval")) != final_eval:
+                continue
+            filtered.append(row)
+        filtered.sort(key=_record_sort_key)
+        return filtered[:limit] if limit is not None else filtered
 
-        Safety rules:
-        - Sanity check: reject val_bpb <= 0 or suspiciously low (< 0.5) — likely a bug
-        - Read-compare-write: re-read current best right before writing to minimize race window
-        - Previous best is always preserved in the new record for recovery
-        """
-        try:
-            # Sanity: reject obviously bogus values
-            if val_bpb <= 0:
-                self._log(f"REJECTED best update: val_bpb={val_bpb} <= 0 (likely a crash/bug)")
-                return False
-            if val_bpb < 0.5:
-                self._log(f"REJECTED best update: val_bpb={val_bpb} < 0.5 (suspiciously low, likely a bug)")
-                return False
+    def pull_best_config(
+        self,
+        scope: str = "global",
+        *,
+        role: str | None = None,
+        family: str | None = None,
+    ) -> Optional[dict[str, Any]]:
+        bests = self._load_best_results()
+        record = None
+        if scope == "global":
+            record = bests.get("global_best")
+        elif scope == "role":
+            record = bests.get("by_role", {}).get(role or self.role)
+        elif scope == "family":
+            if not family:
+                raise ValueError("family is required when scope='family'")
+            record = bests.get("by_family", {}).get(family)
+        else:
+            raise ValueError(f"Unknown scope: {scope}")
 
-            # Read current best
-            meta_key = f"@{HUB_ORG}/best/metadata"
-            meta = self._rpc("get_memory", {"key_names": [meta_key]})
-            meta_results = meta.get("results", [])
-
-            previous_best_bpb = None
-            previous_best_by = None
-            previous_best_description = None
-            if meta_results and meta_results[0].get("status") == "success":
-                current = json.loads(meta_results[0].get("value", "{}"))
-                previous_best_bpb = current.get("val_bpb")
-                previous_best_by = current.get("agent_id")
-                previous_best_description = current.get("description")
-                if previous_best_bpb is not None and val_bpb >= previous_best_bpb:
-                    return False  # not better
-
-            # Sanity: improvement shouldn't be impossibly large (> 0.1 in one step)
-            if previous_best_bpb is not None:
-                improvement = previous_best_bpb - val_bpb
-                if improvement > 0.1:
-                    self._log(f"REJECTED best update: improvement of {improvement:.4f} is suspiciously large (> 0.1 in one step)")
-                    return False
-
-            # Re-read right before write to minimize race window
-            meta2 = self._rpc("get_memory", {"key_names": [meta_key]})
-            meta2_results = meta2.get("results", [])
-            if meta2_results and meta2_results[0].get("status") == "success":
-                current2 = json.loads(meta2_results[0].get("value", "{}"))
-                current2_bpb = current2.get("val_bpb")
-                if current2_bpb is not None and val_bpb >= current2_bpb:
-                    self._log(f"Lost best update race: someone posted {current2_bpb:.6f} while we were checking")
-                    return False
-
-            # Enrich metadata — always preserve previous best for recovery
-            best_data = {
-                **result_data,
-                "best_val_bpb": val_bpb,
-                "achieved_by": self.agent_id or "unknown",
-                "achieved_at": _now_iso(),
-                "previous_best_val_bpb": previous_best_bpb,
-                "previous_best_by": previous_best_by,
-                "previous_best_description": previous_best_description,
-                "improvement_over_previous": (previous_best_bpb - val_bpb) if previous_best_bpb is not None else None,
-            }
-
-            # Upsert best/train_py (create if missing, update if exists)
-            code_key = f"@{HUB_ORG}/best/train_py"
-            code_b64 = base64.b64encode(train_py_source.encode()).decode()
-            try:
-                self._rpc("update_memory", {
-                    "key_name": code_key,
-                    "value": code_b64,
-                    "base64": True,
-                })
-            except Exception:
-                self._rpc("create_memory", {"items": [{
-                    "key_name": code_key,
-                    "description": "[autoresearch] Current best train.py source code",
-                    "value": code_b64,
-                    "base64": True,
-                }]})
-
-            # Upsert best/metadata
-            meta_b64 = base64.b64encode(json.dumps(best_data).encode()).decode()
-            try:
-                self._rpc("update_memory", {
-                    "key_name": meta_key,
-                    "value": meta_b64,
-                    "base64": True,
-                })
-            except Exception:
-                self._rpc("create_memory", {"items": [{
-                    "key_name": meta_key,
-                    "description": "[autoresearch] Metadata for current best train.py",
-                    "value": meta_b64,
-                    "base64": True,
-                }]})
-
-            improvement = (previous_best_bpb - val_bpb) if previous_best_bpb else 0
-            prev_info = f" (improved {improvement:.4f} over {previous_best_by}'s {previous_best_bpb:.6f})" if previous_best_bpb else ""
-            self._log(f"NEW GLOBAL BEST! val_bpb={val_bpb:.6f}{prev_info}")
-            return True
-
-        except Exception as e:
-            self._log(f"maybe_update_best error: {e}")
-            return False
-
-    # --- Config Sharing ---
-
-    def pull_best_config(self) -> Optional[tuple[str, dict]]:
-        """
-        Pull the current global best train.py and metadata.
-        Returns (source_code, metadata_dict) or None.
-        """
-        try:
-            meta_key = f"@{HUB_ORG}/best/metadata"
-            code_key = f"@{HUB_ORG}/best/train_py"
-
-            meta = self._rpc("get_memory", {"key_names": [meta_key]})
-            meta_results = meta.get("results", [])
-            if not meta_results or meta_results[0].get("status") != "success":
-                return None
-
-            code = self._rpc("get_memory", {"key_names": [code_key]})
-            code_results = code.get("results", [])
-            if not code_results or code_results[0].get("status") != "success":
-                return None
-
-            metadata = json.loads(meta_results[0]["value"])
-            source = code_results[0]["value"]
-
-            self._log(f"Pulled best config: val_bpb={metadata.get('val_bpb', '?')} (by {metadata.get('agent_id', '?')})")
-            return source, metadata
-
-        except Exception as e:
-            self._log(f"pull_best_config error: {e}")
+        if not record:
             return None
 
+        train_py_path = Path(record["train_py_path"])
+        train_py_source = train_py_path.read_text() if train_py_path.exists() else None
+        metrics = record.get("metrics", {})
+        result = {
+            "record": record,
+            "train_py_path": str(train_py_path),
+            "train_py_source": train_py_source,
+            "artifact_dir": record.get("shared_artifact_dir") or record.get("artifacts_dir"),
+            "checkpoint_path": metrics.get("checkpoint_path"),
+            "manifest_path": metrics.get("manifest_path"),
+            "config_path": metrics.get("config_path"),
+            "val_logits_path": metrics.get("val_logits_path"),
+        }
+        self._log(
+            f"Pulled best config scope={scope} "
+            f"val_errors={metrics.get('val_errors')} role={record.get('role')} family={metrics.get('model_family')}"
+        )
+        return result
+
+    def get_gpu_lease_status(self) -> dict[str, Any] | None:
+        payload = _read_json(self.gpu_lock_path, default={})
+        if not payload:
+            return None
+        heartbeat_age = _timestamp_age_seconds(payload.get("heartbeat_at") or payload.get("acquired_at"))
+        stale = heartbeat_age is None or heartbeat_age > GPU_HEARTBEAT_STALE_SECONDS
+        result = dict(payload)
+        result["stale"] = stale
+        result["heartbeat_age_seconds"] = heartbeat_age
+        return result
+
+    def list_agent_statuses(self, include_stale: bool = False) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for path in sorted(self.agents_dir.glob("*.json")):
+            payload = _read_json(path, default={})
+            if not payload:
+                continue
+            age = _timestamp_age_seconds(payload.get("last_seen_at"))
+            stale = age is None or age > AGENT_STALE_SECONDS
+            payload["status_path"] = str(path)
+            payload["stale"] = stale
+            payload["last_seen_age_seconds"] = age
+            if stale and not include_stale:
+                continue
+            rows.append(payload)
+        rows.sort(
+            key=lambda row: (
+                bool(row.get("stale")),
+                str(row.get("role", "")),
+                str(row.get("agent_id", "")),
+            )
+        )
+        return rows
+
+    # ------------------------------------------------------------------
+    # Thinking utilities
+    # ------------------------------------------------------------------
+
     def should_sync(self) -> bool:
-        """Check if it's time to sync with the global best (every N experiments)."""
         self.experiment_count += 1
         return self.experiment_count % SYNC_EVERY_N == 0
 
-    # --- Collective Intelligence ---
-
-    def ask_swarm(self, question: str, namespace: str = None) -> dict:
-        """
-        Ask the swarm a natural language question and get structured answers.
-
-        Args:
-            question: e.g. "what learning rates have been tried and which worked best?"
-            namespace: scope the search — "results", "insights", "hypotheses", "claims", or None for all
-
-        Returns dict with: relevant_results, best_match, namespace_searched, summary
-        """
-        try:
-            prefix = f"@{HUB_ORG}/"
-            if namespace:
-                prefix = f"@{HUB_ORG}/{namespace}/"
-
-            result = self._rpc("search_memories", {
-                "query": question,
-                "limit": 20,
-                "prefix": prefix,
-            })
-
-            matches = result.get("results", [])
-            relevant = []
-            for match in matches:
-                try:
-                    data = json.loads(match.get("value", "{}"))
-                    data["_score"] = match.get("score", 0)
-                    data["_key"] = match.get("key_name", "")
-                    relevant.append(data)
-                except (json.JSONDecodeError, KeyError):
-                    pass
-
-            # Sort by relevance score
-            relevant.sort(key=lambda x: x.get("_score", 0), reverse=True)
-
-            best_match = relevant[0] if relevant else None
-
-            # Build summary
-            lines = [f"Swarm answer for: {question}"]
-            lines.append(f"Namespace: {namespace or 'all'} | {len(relevant)} results")
-            lines.append("")
-            for r in relevant[:5]:
-                agent = r.get("agent_id", "?")
-                bpb = r.get("val_bpb")
-                status = r.get("status", "")
-                desc = r.get("description", r.get("title", r.get("insight", "?")))
-                score = r.get("_score", 0)
-                if bpb is not None:
-                    lines.append(f"  [{agent}] val_bpb={bpb:.6f} ({status}) — {desc} (relevance={score:.2f})")
-                else:
-                    lines.append(f"  [{agent}] {desc} (relevance={score:.2f})")
-
-            return {
-                "relevant_results": relevant,
-                "best_match": best_match,
-                "namespace_searched": namespace or "all",
-                "summary": "\n".join(lines),
-            }
-
-        except Exception as e:
-            self._log(f"ask_swarm error: {e}")
-            return {"relevant_results": [], "best_match": None, "namespace_searched": namespace or "all", "summary": f"Error: {e}"}
-
-    def list_namespace(self, namespace: str, limit: int = 50) -> list[dict]:
-        """
-        List all keys under a namespace prefix (results, claims, insights, hypotheses).
-
-        Returns list of dicts with key_name and any available metadata.
-        """
-        try:
-            result = self._rpc("list_keys", {
-                "prefix": f"@{HUB_ORG}/{namespace}/",
-                "limit": limit,
-            })
-            keys = result.get("keys", [])
-            entries = []
-            for k in keys:
-                if isinstance(k, dict):
-                    entries.append(k)
-                elif isinstance(k, str):
-                    entries.append({"key_name": k})
-            return entries
-
-        except Exception as e:
-            self._log(f"list_namespace error: {e}")
-            return []
-
-    def analyze_swarm(self) -> dict:
-        """
-        Comprehensive swarm state analysis.
-
-        Returns dict with: global_best, recent_keeps, recent_failures,
-        active_claims, unclaimed_hypotheses, improvement_trend, summary
-        """
-        try:
-            # Global best
-            global_best = None
-            meta_key = f"@{HUB_ORG}/best/metadata"
-            meta = self._rpc("get_memory", {"key_names": [meta_key]})
-            meta_results = meta.get("results", [])
-            if meta_results and meta_results[0].get("status") == "success":
-                global_best = json.loads(meta_results[0].get("value", "{}"))
-
-            # Recent results
-            result_search = self._rpc("search_memories", {
-                "query": "experiment result val_bpb",
-                "limit": 30,
-                "prefix": f"@{HUB_ORG}/results/",
-            })
-            all_results = []
-            for match in result_search.get("results", []):
-                try:
-                    data = json.loads(match.get("value", "{}"))
-                    data["_key"] = match.get("key_name", "")
-                    all_results.append(data)
-                except (json.JSONDecodeError, KeyError):
-                    pass
-
-            recent_keeps = sorted(
-                [r for r in all_results if r.get("status") == "keep"],
-                key=lambda x: x.get("val_bpb", float("inf")),
-            )
-            recent_failures = [r for r in all_results if r.get("status") in ("discard", "crash")]
-
-            # Active claims
-            claim_search = self._rpc("search_memories", {
-                "query": "autoresearch claim experiment",
-                "limit": 20,
-                "prefix": f"@{HUB_ORG}/claims/",
-            })
-            active_claims = []
-            for match in claim_search.get("results", []):
-                try:
-                    data = json.loads(match.get("value", "{}"))
-                    claimed_at = data.get("claimed_at", "")
-                    if claimed_at:
-                        claimed_time = datetime.fromisoformat(claimed_at)
-                        age = (datetime.now(timezone.utc) - claimed_time).total_seconds()
-                        if age < CLAIM_TTL:
-                            active_claims.append(data)
-                except Exception:
-                    pass
-
-            # Unclaimed hypotheses
-            unclaimed = self.get_unclaimed_hypotheses(limit=5)
-
-            # Improvement trend (compare recent keeps)
-            trend = "unknown"
-            if len(recent_keeps) >= 3:
-                recent_bpbs = [r["val_bpb"] for r in recent_keeps[:5] if "val_bpb" in r]
-                older_bpbs = [r["val_bpb"] for r in recent_keeps[5:10] if "val_bpb" in r]
-                if recent_bpbs and older_bpbs:
-                    if min(recent_bpbs) < min(older_bpbs):
-                        trend = "improving"
-                    elif min(recent_bpbs) == min(older_bpbs):
-                        trend = "plateaued"
-                    else:
-                        trend = "regressing"
-
-            # Build summary
-            lines = ["=" * 50, "SWARM ANALYSIS", "=" * 50]
-            if global_best:
-                lines.append(f"Global best: val_bpb={global_best.get('val_bpb', '?'):.6f} by {global_best.get('agent_id', '?')}")
-                if global_best.get("achieved_at"):
-                    lines.append(f"  Achieved at: {global_best['achieved_at']}")
-            else:
-                lines.append("Global best: none yet")
-
-            lines.append(f"\nKeeps ({len(recent_keeps)}):")
-            for r in recent_keeps[:5]:
-                lines.append(f"  [{r.get('agent_id', '?')}] val_bpb={r.get('val_bpb', 0):.6f} — {r.get('description', '?')}")
-
-            lines.append(f"\nFailures ({len(recent_failures)}):")
-            for r in recent_failures[:5]:
-                lines.append(f"  [{r.get('agent_id', '?')}] {r.get('status', '?')} — {r.get('description', '?')}")
-
-            lines.append(f"\nActive claims ({len(active_claims)}):")
-            for c in active_claims:
-                lines.append(f"  [{c.get('agent_id', '?')}] {c.get('description', '?')}")
-
-            lines.append(f"\nUnclaimed hypotheses ({len(unclaimed)}):")
-            for h in unclaimed[:3]:
-                lines.append(f"  {h.get('title', '?')} (priority={h.get('priority', '?')})")
-
-            # Per-agent bests
-            agent_bests = self.get_all_agent_bests()
-
-            lines.append(f"\nAgent personal bests ({len(agent_bests)}):")
-            lines.append("  (improvements relative to each agent's own hardware/baseline)")
-            for ab in agent_bests:
-                prev = ab.get("previous_best_val_bpb")
-                improvement = f" (improved {prev - ab['val_bpb']:.4f} from {prev:.6f})" if prev else ""
-                tier_tag = f" [{ab.get('vram_tier', '?')}]" if ab.get("vram_tier") else ""
-                lines.append(f"  [{ab.get('agent_id', '?')}]{tier_tag} val_bpb={ab.get('val_bpb', 0):.6f}{improvement} — {ab.get('description', '?')}")
-
-            # Per-tier bests
-            tier_bests = self.get_all_tier_bests()
-            has_tier_data = any(v is not None for v in tier_bests.values())
-
-            if has_tier_data:
-                lines.append(f"\nVRAM tier bests:")
-                for tier_name, tb in tier_bests.items():
-                    bound = VRAM_TIERS[tier_name]
-                    label = f"≤{bound}GB" if bound else ">48GB"
-                    if tb:
-                        lines.append(f"  {tier_name} ({label}): val_bpb={tb.get('val_bpb', 0):.6f} by {tb.get('agent_id', '?')} — {tb.get('description', '?')}")
-                    else:
-                        lines.append(f"  {tier_name} ({label}): no results yet")
-
-            lines.append(f"\nTrend: {trend}")
-            lines.append("=" * 50)
-
-            return {
-                "global_best": global_best,
-                "recent_keeps": recent_keeps,
-                "recent_failures": recent_failures,
-                "active_claims": active_claims,
-                "unclaimed_hypotheses": unclaimed,
-                "agent_bests": agent_bests,
-                "tier_bests": tier_bests,
-                "improvement_trend": trend,
-                "summary": "\n".join(lines),
-            }
-
-        except Exception as e:
-            self._log(f"analyze_swarm error: {e}")
-            return {
-                "global_best": None, "recent_keeps": [], "recent_failures": [],
-                "active_claims": [], "unclaimed_hypotheses": [], "agent_bests": [],
-                "tier_bests": {}, "improvement_trend": "unknown", "summary": f"Error: {e}",
-            }
-
-    def post_insight(self, insight: str, evidence_keys: list[str] = None) -> None:
-        """
-        Post an observation/learning to the collective.
-
-        Not a hypothesis with a config — an *insight* about what has been observed.
-        Example: "LR above 0.08 consistently causes instability — 3 agents tried, all regressed"
-        """
-        try:
-            slug = _slugify(insight)
-            agent = _slugify(self.agent_id or "unknown", max_len=20)
-            short_hash = hashlib.sha256(insight.encode()).hexdigest()[:6]
-            insight_key = f"@{HUB_ORG}/insights/{agent}--{slug}--{short_hash}"
-
-            insight_data = {
-                "agent_id": self.agent_id or "unknown",
-                "insight": insight,
-                "evidence_keys": evidence_keys or [],
-                "posted_at": _now_iso(),
-            }
-
-            value_b64 = base64.b64encode(json.dumps(insight_data).encode()).decode()
-            self._rpc("create_memory", {"items": [{
-                "key_name": insight_key,
-                "description": f"[autoresearch] Insight by {self.agent_id or 'unknown'}: {insight}",
-                "value": value_b64,
-                "base64": True,
-                "embed": True,
-                "embed_source": "description",
-            }]})
-
-            self._log(f"Published insight: {insight}")
-
-        except Exception as e:
-            self._log(f"post_insight error: {e}")
-
-    def get_swarm_insights(self, topic: str) -> list[dict]:
-        """Search insights by topic to see what the group has learned."""
-        try:
-            result = self._rpc("search_memories", {
-                "query": topic,
-                "limit": 10,
-                "prefix": f"@{HUB_ORG}/insights/",
-            })
-            insights = []
-            for match in result.get("results", []):
-                try:
-                    data = json.loads(match.get("value", "{}"))
-                    data["_score"] = match.get("score", 0)
-                    data["_key"] = match.get("key_name", "")
-                    insights.append(data)
-                except (json.JSONDecodeError, KeyError):
-                    pass
-            return insights
-
-        except Exception as e:
-            self._log(f"get_swarm_insights error: {e}")
-            return []
-
-    # --- Thinking Phase ---
-
-    def get_recent_results(self, limit: int = 20) -> list[dict]:
-        """Get recent experiment results from the swarm."""
-        try:
-            result = self._rpc("search_memories", {
-                "query": "autoresearch experiment result val_bpb",
-                "limit": limit,
-                "prefix": f"@{HUB_ORG}/results/",
-            })
-            results = []
-            for match in result.get("results", []):
-                try:
-                    data = json.loads(match.get("value", "{}"))
-                    data["_score"] = match.get("score", 0)
-                    data["_key"] = match.get("key_name", "")
-                    results.append(data)
-                except (json.JSONDecodeError, KeyError):
-                    pass
-            return results
-
-        except Exception as e:
-            self._log(f"get_recent_results error: {e}")
-            return []
-
-    def get_unclaimed_hypotheses(self, limit: int = 10) -> list[dict]:
-        """Get hypotheses that haven't been claimed/tested yet."""
-        try:
-            result = self._rpc("search_memories", {
-                "query": "autoresearch hypothesis experiment suggestion",
-                "limit": limit,
-                "prefix": f"@{HUB_ORG}/hypotheses/",
-            })
-            hypotheses = []
-            for match in result.get("results", []):
-                try:
-                    hyp = json.loads(match.get("value", "{}"))
-                    hypotheses.append(hyp)
-                except (json.JSONDecodeError, KeyError):
-                    pass
-            return hypotheses
-
-        except Exception as e:
-            self._log(f"get_unclaimed_hypotheses error: {e}")
-            return []
+    def post_insight(self, insight: str, evidence_keys: list[str] | None = None) -> None:
+        payload = {
+            "agent_id": self.agent_id,
+            "role": self.role,
+            "insight": insight,
+            "evidence_keys": evidence_keys or [],
+            "recorded_at": _now_iso(),
+        }
+        with _locked_file(self.state_lock_path):
+            _append_jsonl(self.insights_path, payload)
+        self._log(f"Posted insight: {insight}")
 
     def publish_hypothesis(
         self,
         title: str,
         hypothesis: str,
-        suggested_config: Optional[dict] = None,
-        evidence_keys: Optional[list[str]] = None,
+        suggested_config: dict[str, Any] | None = None,
+        evidence_keys: list[str] | None = None,
         priority: int = 3,
     ) -> None:
-        """Publish a research hypothesis for other agents to consider."""
-        try:
-            slug = _slugify(title)
-            agent = _slugify(self.agent_id or "unknown", max_len=20)
-            short_hash = hashlib.sha256(title.encode()).hexdigest()[:6]
-            hyp_key = f"@{HUB_ORG}/hypotheses/{agent}--{slug}--{short_hash}"
+        payload = {
+            "agent_id": self.agent_id,
+            "role": self.role,
+            "title": title,
+            "hypothesis": hypothesis,
+            "suggested_config": suggested_config or {},
+            "evidence_keys": evidence_keys or [],
+            "priority": priority,
+            "recorded_at": _now_iso(),
+        }
+        with _locked_file(self.state_lock_path):
+            _append_jsonl(self.hypotheses_path, payload)
+        self._log(f"Published hypothesis: {title}")
 
-            hyp_data = {
-                "agent_id": self.agent_id or "unknown",
-                "title": title,
-                "hypothesis": hypothesis,
-                "suggested_config": suggested_config,
-                "evidence_keys": evidence_keys or [],
-                "priority": priority,
-                "created_at": _now_iso(),
-            }
+    def get_swarm_insights(self, topic: str, limit: int = 10) -> list[dict[str, Any]]:
+        topic_norm = topic.lower()
+        matches = []
+        for row in _load_jsonl(self.insights_path):
+            if topic_norm in row.get("insight", "").lower():
+                matches.append(row)
+        return matches[:limit]
 
-            value_b64 = base64.b64encode(json.dumps(hyp_data).encode()).decode()
-            self._rpc("create_memory", {"items": [{
-                "key_name": hyp_key,
-                "description": f"[autoresearch] Hypothesis: {title}",
-                "value": value_b64,
-                "base64": True,
-                "embed": True,
-                "embed_source": "description",
-            }]})
+    def get_unclaimed_hypotheses(self, limit: int = 10) -> list[dict[str, Any]]:
+        rows = _load_jsonl(self.hypotheses_path)
+        rows.sort(key=lambda row: (-int(row.get("priority", 0)), row.get("recorded_at", "")))
+        return rows[:limit]
 
-            self._log(f"Published hypothesis: {title}")
+    def analyze_swarm(self) -> dict[str, Any]:
+        bests = self._load_best_results()
+        recent_results = self.get_ranked_results(limit=10, status="keep")
+        failures = [
+            row
+            for row in reversed(_load_jsonl(self.experiment_log_path))
+            if row.get("status") in {"discard", "crash"}
+        ][:10]
 
-        except Exception as e:
-            self._log(f"publish_hypothesis error: {e}")
+        active_claims = []
+        for claim_file in sorted(self.claims_dir.glob("*.json")):
+            payload = _read_json(claim_file, default={})
+            if not payload:
+                continue
+            if self._is_claim_stale(payload):
+                claim_file.unlink(missing_ok=True)
+                continue
+            active_claims.append(payload)
 
-    def search_experiments(self, query: str, limit: int = 10) -> list[dict]:
-        """Semantic search over past experiment results."""
-        try:
-            result = self._rpc("search_memories", {
-                "query": query,
-                "limit": limit,
-                "prefix": f"@{HUB_ORG}/results/",
-            })
-            results = []
-            for match in result.get("results", []):
-                try:
-                    data = json.loads(match.get("value", "{}"))
-                    data["_score"] = match.get("score", 0)
-                    data["_key"] = match.get("key_name", "")
-                    results.append(data)
-                except (json.JSONDecodeError, KeyError):
-                    pass
-            return results
+        gpu_lease = self.get_gpu_lease_status()
+        active_agents = self.list_agent_statuses()
 
-        except Exception as e:
-            self._log(f"search_experiments error: {e}")
-            return []
+        lines = [
+            "=" * 56,
+            "LOCAL AUTORESEARCH SWARM",
+            "=" * 56,
+            f"Shared dir: {self.shared_dir}",
+            f"Agent: {self.agent_id} ({self.role})",
+        ]
+        global_best = bests.get("global_best")
+        if global_best:
+            metrics = global_best.get("metrics", {})
+            lines.append(
+                "Global best: "
+                f"val_errors={metrics.get('val_errors')} "
+                f"val_loss={metrics.get('val_loss'):.6f} "
+                f"role={global_best.get('role')} family={metrics.get('model_family')}"
+            )
+        else:
+            lines.append("Global best: none yet")
 
-    def get_leaderboard(self) -> list[dict]:
-        """Get the current global leaderboard."""
-        try:
-            result = self._rpc("get_memory", {
-                "key_names": [f"@{HUB_ORG}/leaderboard"],
-            })
-            results = result.get("results", [])
-            if results and results[0].get("status") == "success":
-                data = json.loads(results[0]["value"])
-                return data.get("entries", [])
-            return []
-        except Exception as e:
-            self._log(f"get_leaderboard error: {e}")
-            return []
+        if gpu_lease and not gpu_lease.get("stale"):
+            lines.append(
+                "GPU lease: "
+                f"held by {gpu_lease.get('role')}:{gpu_lease.get('agent_id')} "
+                f"for {gpu_lease.get('heartbeat_age_seconds', 0):.0f}s since last heartbeat"
+            )
+        else:
+            lines.append("GPU lease: free")
+
+        lines.append(f"Active agents: {len(active_agents)}")
+        for agent in active_agents[:5]:
+            lines.append(
+                f"  [{agent.get('role')}] {agent.get('agent_id')} "
+                f"{agent.get('state')} - {agent.get('message')}"
+            )
+
+        lines.append(f"Active claims: {len(active_claims)}")
+        for claim in active_claims[:5]:
+            lines.append(f"  [{claim.get('role')}] {claim.get('description')}")
+
+        lines.append(f"Recent keeps: {len(recent_results)}")
+        for row in recent_results[:5]:
+            metrics = row.get("metrics", {})
+            lines.append(
+                f"  [{row.get('role')}] val_errors={metrics.get('val_errors')} "
+                f"val_loss={metrics.get('val_loss'):.6f} {row.get('description')}"
+            )
+
+        lines.append(f"Recent failures: {len(failures)}")
+        for row in failures[:5]:
+            lines.append(f"  [{row.get('role')}] {row.get('status')} {row.get('description')}")
+
+        by_role = bests.get("by_role", {})
+        if by_role:
+            lines.append("Best by role:")
+            for role_name, row in sorted(by_role.items()):
+                metrics = row.get("metrics", {})
+                lines.append(
+                    f"  {role_name}: val_errors={metrics.get('val_errors')} "
+                    f"family={metrics.get('model_family')} {row.get('description')}"
+                )
+
+        by_family = bests.get("by_family", {})
+        if by_family:
+            lines.append("Best by family:")
+            for family_name, row in sorted(by_family.items()):
+                metrics = row.get("metrics", {})
+                lines.append(
+                    f"  {family_name}: val_errors={metrics.get('val_errors')} "
+                    f"role={row.get('role')} {row.get('description')}"
+                )
+
+        lines.append("=" * 56)
+        return {
+            "global_best": global_best,
+            "by_role": by_role,
+            "by_family": by_family,
+            "recent_keeps": recent_results,
+            "recent_failures": failures,
+            "active_claims": active_claims,
+            "active_agents": active_agents,
+            "gpu_lease": gpu_lease,
+            "summary": "\n".join(lines),
+        }
+
+
+Coordinator = LocalCoordinator

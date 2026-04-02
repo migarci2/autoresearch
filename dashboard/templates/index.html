@@ -1,0 +1,1377 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Autoresearch MNIST Swarm</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='dashboard.css') }}" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.8/dist/chart.umd.min.js"></script>
+  </head>
+  <body>
+    <div class="background-orbs" aria-hidden="true">
+      <div class="orb orb-a"></div>
+      <div class="orb orb-b"></div>
+      <div class="orb orb-c"></div>
+    </div>
+
+    <main class="shell">
+      <header class="topbar panel">
+        <div class="brand">
+          <span class="eyebrow">Local Codex swarm</span>
+          <h1>MNIST dashboard</h1>
+          <p class="lede">
+            Read-only control surface for the multi-agent search loop. The scoreboard is ranked by validation errors,
+            with test metrics shown only for frozen final evaluations.
+          </p>
+        </div>
+        <div class="topbar-meta">
+          <div class="meta-card">
+            <span class="meta-label">Updated</span>
+            <strong id="updated-at">{{ state.summary.generated_at }}</strong>
+          </div>
+          <div class="meta-card">
+            <span class="meta-label">Auto refresh</span>
+            <strong>10s</strong>
+          </div>
+          <div class="meta-card">
+            <span class="meta-label">Shared state</span>
+            <strong>{{ state.summary.shared_dir }}</strong>
+          </div>
+        </div>
+      </header>
+
+      <section class="hero-grid">
+        <article class="panel hero panel-glow">
+          <div class="hero-copy">
+            <span class="eyebrow">Global best</span>
+            {% if state.summary.global_best %}
+              <h2>
+                {{ "%.0f"|format(state.summary.global_best_error) if state.summary.global_best_error is not none else "—" }} errors
+              </h2>
+              <p class="hero-subtitle">
+                Best family: <strong>{{ state.summary.top_line.best_family or "—" }}</strong>
+                · Best role: <strong>{{ state.summary.top_line.best_role or "—" }}</strong>
+                · Run mode: <strong>{{ state.summary.top_line.run_mode or "—" }}</strong>
+              </p>
+              <div class="hero-tags">
+                <span class="tag">val acc {{ "%.4f"|format(state.summary.global_best_accuracy) if state.summary.global_best_accuracy is not none else "—" }}</span>
+                <span class="tag">val loss {{ "%.5f"|format(state.summary.global_best_loss) if state.summary.global_best_loss is not none else "—" }}</span>
+                {% if state.summary.global_best_test_errors is not none %}
+                  <span class="tag dim">test errors {{ "%.0f"|format(state.summary.global_best_test_errors) }}</span>
+                {% endif %}
+                {% if state.summary.global_best_test_accuracy is not none %}
+                  <span class="tag dim">test acc {{ "%.4f"|format(state.summary.global_best_test_accuracy) }}</span>
+                {% endif %}
+              </div>
+            {% else %}
+              <h2>No keep yet</h2>
+              <p class="hero-subtitle">
+                The swarm has not published a winning run yet. Once the first keep lands, this area becomes the live
+                scoreboard for the search.
+              </p>
+            {% endif %}
+          </div>
+          <div class="hero-stats">
+            <div class="stat-tile">
+              <span>Experiments</span>
+              <strong id="count-experiments">{{ state.summary.counts.experiments }}</strong>
+            </div>
+            <div class="stat-tile">
+              <span>Keeps</span>
+              <strong id="count-keeps">{{ state.summary.counts.keeps }}</strong>
+            </div>
+            <div class="stat-tile">
+              <span>Discards</span>
+              <strong id="count-discards">{{ state.summary.counts.discards }}</strong>
+            </div>
+            <div class="stat-tile">
+              <span>Crashes</span>
+              <strong id="count-crashes">{{ state.summary.counts.crashes }}</strong>
+            </div>
+          </div>
+        </article>
+
+        <aside class="panel status-panel">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">System state</span>
+              <h3>Lease and queue</h3>
+            </div>
+            <span class="pill {{ 'good' if not state.summary.gpu_lock.stale else 'warn' if state.summary.gpu_lock.locked else 'idle' }}" id="gpu-pill">
+              {% if state.summary.gpu_lock.locked %}
+                {{ "stale" if state.summary.gpu_lock.stale else "locked" }}
+              {% else %}
+                free
+              {% endif %}
+            </span>
+          </div>
+          <dl class="status-list">
+            <div>
+              <dt>GPU holder</dt>
+              <dd id="gpu-holder">{{ state.summary.gpu_lock.agent_id or "—" }}</dd>
+            </div>
+            <div>
+              <dt>Role</dt>
+              <dd id="gpu-role">{{ state.summary.gpu_lock.role or "—" }}</dd>
+            </div>
+            <div>
+              <dt>Acquired</dt>
+              <dd id="gpu-acquired">{{ state.summary.gpu_lock.acquired_at or "—" }}</dd>
+            </div>
+            <div>
+              <dt>Age</dt>
+              <dd id="gpu-age">{{ state.summary.gpu_lock.age_seconds|default(None) }}</dd>
+            </div>
+            <div>
+              <dt>Active claims</dt>
+              <dd id="count-claims">{{ state.summary.counts.active_claims }}</dd>
+            </div>
+            <div>
+              <dt>Stale claims</dt>
+              <dd id="count-stale">{{ state.summary.counts.stale_claims }}</dd>
+            </div>
+          </dl>
+          <div class="inline-links">
+            <a href="{{ state.summary.links.experiment_log }}" target="_blank" rel="noreferrer">Experiment log</a>
+            <a href="{{ state.summary.links.best_results }}" target="_blank" rel="noreferrer">Best results</a>
+            <a href="{{ state.summary.links.claims }}" target="_blank" rel="noreferrer">Claims</a>
+            <a href="{{ state.summary.links.locks }}" target="_blank" rel="noreferrer">Locks</a>
+            <a href="{{ state.summary.links.agents }}" target="_blank" rel="noreferrer">Agents</a>
+          </div>
+        </aside>
+      </section>
+
+      <section class="metrics-grid">
+        <article class="panel metric-card">
+          <span class="metric-label">Validation errors</span>
+          <strong id="metric-val-errors">{{ "%.0f"|format(state.summary.global_best_error) if state.summary.global_best_error is not none else "—" }}</strong>
+          <small>Primary ranking metric</small>
+        </article>
+        <article class="panel metric-card">
+          <span class="metric-label">Validation loss</span>
+          <strong id="metric-val-loss">{{ "%.5f"|format(state.summary.global_best_loss) if state.summary.global_best_loss is not none else "—" }}</strong>
+          <small>Lower is better, used as tie-breaker</small>
+        </article>
+        <article class="panel metric-card">
+          <span class="metric-label">Final test errors</span>
+          <strong id="metric-test-errors">{{ "%.0f"|format(state.summary.global_best_test_errors) if state.summary.global_best_test_errors is not none else "—" }}</strong>
+          <small>Only populated for frozen final evaluations</small>
+        </article>
+        <article class="panel metric-card">
+          <span class="metric-label">Final test accuracy</span>
+          <strong id="metric-test-accuracy">{{ "%.4f"|format(state.summary.global_best_test_accuracy) if state.summary.global_best_test_accuracy is not none else "—" }}</strong>
+          <small>Held out from search-time selection</small>
+        </article>
+      </section>
+
+      <section class="runpod-grid">
+        <article class="panel runpod-panel panel-glow">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">RunPod</span>
+              <h3>Pod and supervisor state</h3>
+            </div>
+            <span class="pill {{ 'good' if state.runpod.summary.loaded and state.runpod.summary.state == 'running' else 'warn' if state.runpod.summary.loaded else 'idle' }}" id="runpod-state-pill">
+              {{ state.runpod.summary.state or "unknown" }}
+            </span>
+          </div>
+          <div class="runpod-metrics">
+            <div class="stat-tile">
+              <span>Pod</span>
+              <strong id="runpod-pod-id">{{ state.runpod.summary.pod_id or "—" }}</strong>
+            </div>
+            <div class="stat-tile">
+              <span>SSH endpoint</span>
+              <strong id="runpod-ssh-endpoint">{{ state.runpod.summary.ssh_endpoint or "—" }}</strong>
+            </div>
+            <div class="stat-tile">
+              <span>Services running</span>
+              <strong id="runpod-services-running">{{ state.runpod.summary.services_running or 0 }}</strong>
+            </div>
+            <div class="stat-tile">
+              <span>Uptime</span>
+              <strong id="runpod-uptime">{{ state.runpod.summary.uptime_seconds if state.runpod.summary.uptime_seconds is not none else "—" }}</strong>
+            </div>
+          </div>
+          <dl class="status-list runpod-kv">
+            <div>
+              <dt>Workspace</dt>
+              <dd id="runpod-workspace">{{ state.runpod.summary.workspace_dir or "—" }}</dd>
+            </div>
+            <div>
+              <dt>App dir</dt>
+              <dd id="runpod-app-dir">{{ state.runpod.summary.app_dir or "—" }}</dd>
+            </div>
+            <div>
+              <dt>Dashboard port</dt>
+              <dd id="runpod-dashboard-port">{{ state.runpod.summary.dashboard_port or "—" }}</dd>
+            </div>
+            <div>
+              <dt>SSH port</dt>
+              <dd id="runpod-ssh-port">{{ state.runpod.summary.ssh_port or "—" }}</dd>
+            </div>
+            <div>
+              <dt>Restarting</dt>
+              <dd id="runpod-services-restarting">{{ state.runpod.summary.services_restarting or 0 }}</dd>
+            </div>
+            <div>
+              <dt>Exited</dt>
+              <dd id="runpod-services-exited">{{ state.runpod.summary.services_exited or 0 }}</dd>
+            </div>
+          </dl>
+          <div class="auth-alerts">
+            <div class="section-heading compact">
+              <div>
+                <span class="eyebrow">Alerts</span>
+                <h4>Pod health</h4>
+              </div>
+            </div>
+            <ul class="alert-list" id="runpod-alert-list">
+              {% for alert in state.runpod.summary.alerts %}
+                <li class="alert-item {{ alert.level }}">
+                  <strong>{{ alert.title }}</strong>
+                  <span>{{ alert.message }}</span>
+                </li>
+              {% else %}
+                <li class="empty-note">No RunPod alerts right now.</li>
+              {% endfor %}
+            </ul>
+          </div>
+          <div class="inline-links">
+            <a href="{{ state.runpod.summary.links.supervisor }}" target="_blank" rel="noreferrer">Supervisor</a>
+            <a href="{{ state.runpod.summary.links.processes }}" target="_blank" rel="noreferrer">Processes</a>
+            <a href="{{ state.runpod.summary.links.events }}" target="_blank" rel="noreferrer">Events</a>
+          </div>
+        </article>
+
+        <article class="panel runpod-process-panel">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">Process map</span>
+              <h3>Supervisor process roster</h3>
+            </div>
+            <div class="section-actions">
+              <span class="chip">total {{ state.runpod.summary.services_total or 0 }}</span>
+              <span class="chip">policy {{ state.runpod.summary.restart_policy or "—" }}</span>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Kind</th>
+                  <th>State</th>
+                  <th>PID</th>
+                  <th>Restarts</th>
+                  <th>Started</th>
+                  <th>Last exit</th>
+                </tr>
+              </thead>
+              <tbody id="runpod-processes-table">
+                {% for process in state.runpod.processes %}
+                  <tr>
+                    <td>{{ process.name }}</td>
+                    <td>{{ process.kind }}</td>
+                    <td><span class="pill {{ process.state }}">{{ process.state }}</span></td>
+                    <td>{{ process.pid or "—" }}</td>
+                    <td>{{ process.restart_count or 0 }}</td>
+                    <td>{{ process.started_at or "—" }}</td>
+                    <td>{{ process.last_exit_at or "—" }}</td>
+                  </tr>
+                {% else %}
+                  <tr>
+                    <td colspan="7">
+                      <div class="empty-state">
+                        <strong>No supervisor process data yet.</strong>
+                        <span>Once the RunPod supervisor starts, its managed services will appear here.</span>
+                      </div>
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section class="auth-grid">
+        <article class="panel auth-panel panel-glow">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">Auth pool</span>
+              <h3>Account health and capacity</h3>
+            </div>
+            <span class="chip">read-only</span>
+          </div>
+          <div class="auth-metrics">
+            <div class="stat-tile">
+              <span>Accounts</span>
+              <strong id="auth-count-accounts">{{ state.summary.counts.accounts }}</strong>
+            </div>
+            <div class="stat-tile">
+              <span>Healthy</span>
+              <strong id="auth-count-healthy">{{ state.summary.counts.auth_healthy }}</strong>
+            </div>
+            <div class="stat-tile">
+              <span>Leased</span>
+              <strong id="auth-count-leased">{{ state.summary.counts.auth_leased }}</strong>
+            </div>
+            <div class="stat-tile">
+              <span>Suspect</span>
+              <strong id="auth-count-suspect">{{ state.summary.counts.auth_suspect }}</strong>
+            </div>
+            <div class="stat-tile">
+              <span>Free capacity</span>
+              <strong id="auth-count-free">{{ state.summary.counts.auth_capacity_free }}</strong>
+            </div>
+            <div class="stat-tile">
+              <span>Waiting</span>
+              <strong id="auth-count-waiting">{{ state.summary.counts.auth_waiting }}</strong>
+            </div>
+          </div>
+          <div class="auth-alerts">
+            <div class="section-heading compact">
+              <div>
+                <span class="eyebrow">Alerts</span>
+                <h4>Operational issues</h4>
+              </div>
+            </div>
+            <ul class="alert-list" id="auth-alert-list">
+              {% for alert in state.auth.summary.alerts %}
+                <li class="alert-item {{ alert.level }}">
+                  <strong>{{ alert.title }}</strong>
+                  <span>{{ alert.message }}</span>
+                </li>
+              {% else %}
+                <li class="empty-note">No auth alerts right now.</li>
+              {% endfor %}
+            </ul>
+          </div>
+          <div class="auth-feed">
+            <div class="section-heading compact">
+              <div>
+                <span class="eyebrow">Audit trail</span>
+                <h4>Recent auth events</h4>
+              </div>
+            </div>
+            <ul class="event-feed" id="auth-event-feed">
+              {% for event in state.auth.events[:8] %}
+                <li>
+                  <strong>{{ event.account_id or event.agent_id or event.role or event.kind }}</strong>
+                  <span>{{ event.message or event.event or event.kind }}</span>
+                  <small>{{ event.recorded_label }}</small>
+                </li>
+              {% else %}
+                <li class="empty-note">No auth events yet.</li>
+              {% endfor %}
+            </ul>
+          </div>
+        </article>
+
+        <article class="panel accounts-panel">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">Accounts</span>
+              <h3>Pool roster</h3>
+            </div>
+            <span class="chip" id="auth-summary-free">{{ state.summary.counts.auth_capacity_free }} free slots</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Account</th>
+                  <th>Status</th>
+                  <th>Capacity</th>
+                  <th>Used</th>
+                  <th>Free</th>
+                  <th>Agents</th>
+                  <th>Last check</th>
+                </tr>
+              </thead>
+              <tbody id="accounts-table">
+                {% for account in state.auth.accounts %}
+                  <tr>
+                    <td>
+                      <div class="stacked-cell">
+                        <strong>{{ account.label }}</strong>
+                        <span>{{ account.account_id }}</span>
+                      </div>
+                    </td>
+                    <td><span class="pill {{ account.status }}">{{ account.status }}</span></td>
+                    <td>{{ account.capacity }}</td>
+                    <td>{{ account.used_capacity }}</td>
+                    <td>{{ account.free_capacity }}</td>
+                    <td>
+                      <div class="stacked-cell">
+                        <strong>{{ account.active_lease_count }}</strong>
+                        <span>{% if account.agents %}{{ account.agents|length }} mapped{% else %}—{% endif %}</span>
+                      </div>
+                    </td>
+                    <td>{{ account.last_verified_at or account.expires_at or "—" }}</td>
+                  </tr>
+                {% else %}
+                  <tr>
+                    <td colspan="7">
+                      <div class="empty-state">
+                        <strong>No account inventory yet.</strong>
+                        <span>Add `shared/accounts/health.json` or lease files and the pool summary will appear here.</span>
+                      </div>
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section class="panel leases-panel">
+        <div class="section-heading">
+          <div>
+            <span class="eyebrow">Leases</span>
+            <h3>Account-to-agent assignments</h3>
+          </div>
+          <div class="section-actions">
+            <span class="chip">active leases {{ state.summary.counts.auth_leased }}</span>
+            <span class="chip">waiting {{ state.summary.counts.auth_waiting }}</span>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Lease</th>
+                <th>Account</th>
+                <th>Agent</th>
+                <th>Role</th>
+                <th>Status</th>
+                <th>Expires</th>
+                <th>Heartbeat</th>
+                <th>Capacity</th>
+              </tr>
+            </thead>
+            <tbody id="leases-table">
+              {% for lease in state.auth.leases %}
+                <tr>
+                  <td>
+                    <div class="stacked-cell">
+                      <strong>{{ lease.lease_id }}</strong>
+                      <span>{{ lease.path }}</span>
+                    </div>
+                  </td>
+                  <td>{{ lease.account_label or lease.account_id }}</td>
+                  <td>{{ lease.agent_id or "—" }}</td>
+                  <td>{{ lease.role or "—" }}</td>
+                  <td><span class="pill {{ lease.status }}">{{ lease.status }}</span></td>
+                  <td>{{ lease.expires_at or "—" }}</td>
+                  <td>{{ lease.heartbeat_at or "—" }}</td>
+                  <td>{{ lease.capacity }}</td>
+                </tr>
+              {% else %}
+                <tr>
+                  <td colspan="8">
+                    <div class="empty-state">
+                      <strong>No leases recorded yet.</strong>
+                      <span>Lease files in `shared/accounts/leases/` will appear here, including account-to-agent mapping.</span>
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <div class="mapping-grid">
+          <div>
+            <h4>Agent to account map</h4>
+            <table class="compact-table">
+              <thead>
+                <tr>
+                  <th>Agent</th>
+                  <th>Role</th>
+                  <th>Account</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="agent-account-map">
+                {% for item in state.auth.agent_map %}
+                  <tr>
+                    <td>{{ item.agent_id }}</td>
+                    <td>{{ item.role or "—" }}</td>
+                    <td>{{ item.account_label or item.account_id or "—" }}</td>
+                    <td><span class="pill {{ item.status or 'idle' }}">{{ item.status or "—" }}</span></td>
+                  </tr>
+                {% else %}
+                  <tr>
+                    <td colspan="4" class="muted-row">No agent/account mapping yet.</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          <div class="mapping-summary">
+            <h4>Health snapshot</h4>
+            <dl class="mini-kv">
+              <div><dt>Total capacity</dt><dd id="auth-capacity-total">{{ state.summary.counts.auth_capacity_total }}</dd></div>
+              <div><dt>Free capacity</dt><dd id="auth-capacity-free">{{ state.summary.counts.auth_capacity_free }}</dd></div>
+              <div><dt>Waiting agents</dt><dd id="auth-waiting-agents">{{ state.summary.counts.auth_waiting }}</dd></div>
+              <div><dt>Suspect accounts</dt><dd id="auth-suspect-count">{{ state.summary.counts.auth_suspect }}</dd></div>
+            </dl>
+          </div>
+        </div>
+      </section>
+
+      <section class="chart-grid">
+        <article class="panel chart-panel">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">Timeline</span>
+              <h3>Best-so-far validation errors</h3>
+            </div>
+            <span class="chip">cumulative incumbent</span>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="errors-chart"></canvas>
+          </div>
+        </article>
+        <article class="panel chart-panel">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">Tie-breaker</span>
+              <h3>Best-so-far validation loss</h3>
+            </div>
+            <span class="chip">same incumbent</span>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="loss-chart"></canvas>
+          </div>
+        </article>
+      </section>
+
+      <section class="content-grid">
+        <article class="panel leaderboard-panel">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">Leaderboard</span>
+              <h3>Best runs by role and family</h3>
+            </div>
+          </div>
+          <div class="leaderboard-stack">
+            <div>
+              <h4>Global best</h4>
+              {% if state.leaderboard.global_best %}
+                <dl class="mini-kv">
+                  <div><dt>Run</dt><dd>{{ state.leaderboard.global_best.experiment_key }}</dd></div>
+                  <div><dt>Role</dt><dd>{{ state.leaderboard.global_best.role }}</dd></div>
+                  <div><dt>Family</dt><dd>{{ state.leaderboard.global_best.model_family }}</dd></div>
+                  <div><dt>Errors</dt><dd>{{ state.leaderboard.global_best.val_errors }}</dd></div>
+                  <div><dt>Loss</dt><dd>{{ state.leaderboard.global_best.val_loss }}</dd></div>
+                  <div><dt>Time</dt><dd>{{ state.leaderboard.global_best.training_seconds|default("—") }}</dd></div>
+                </dl>
+              {% else %}
+                <p class="empty-note">No keep has been published yet.</p>
+              {% endif %}
+            </div>
+            <div class="split-table">
+              <div>
+                <h4>By role</h4>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Role</th>
+                      <th>Errors</th>
+                      <th>Loss</th>
+                      <th>Family</th>
+                    </tr>
+                  </thead>
+                  <tbody id="role-leaderboard">
+                    {% for row in state.leaderboard.by_role %}
+                      <tr>
+                        <td>{{ row.role }}</td>
+                        <td>{{ row.val_errors }}</td>
+                        <td>{{ row.val_loss }}</td>
+                        <td>{{ row.model_family }}</td>
+                      </tr>
+                    {% else %}
+                      <tr><td colspan="4" class="muted-row">No role winners yet.</td></tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+              <div>
+                <h4>By family</h4>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Family</th>
+                      <th>Errors</th>
+                      <th>Loss</th>
+                      <th>Role</th>
+                    </tr>
+                  </thead>
+                  <tbody id="family-leaderboard">
+                    {% for row in state.leaderboard.by_family %}
+                      <tr>
+                        <td>{{ row.family }}</td>
+                        <td>{{ row.val_errors }}</td>
+                        <td>{{ row.val_loss }}</td>
+                        <td>{{ row.role }}</td>
+                      </tr>
+                    {% else %}
+                      <tr><td colspan="4" class="muted-row">No family winners yet.</td></tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel agents-panel">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">Agents</span>
+              <h3>Live roster</h3>
+            </div>
+          </div>
+          <div class="agent-list" id="agent-list">
+            {% for agent in state.agents %}
+              <article class="agent-card">
+                <div class="agent-head">
+                  <div>
+                    <strong>{{ agent.display_name }}</strong>
+                    <span>{{ agent.agent_id }}</span>
+                  </div>
+                  <span class="pill {{ agent.status }}">{{ agent.status }}</span>
+                </div>
+                <dl class="agent-kv">
+                  <div><dt>Role</dt><dd>{{ agent.role or "—" }}</dd></div>
+                  <div><dt>Family</dt><dd>{{ agent.model_family or "—" }}</dd></div>
+                  <div><dt>Run mode</dt><dd>{{ agent.run_mode or "—" }}</dd></div>
+                  <div><dt>Account</dt><dd>{{ agent.account_label or agent.account_id or "—" }}</dd></div>
+                  <div><dt>Auth</dt><dd>{{ agent.account_status or "—" }}</dd></div>
+                  <div><dt>Last seen</dt><dd>{{ agent.last_seen or "—" }}</dd></div>
+                  <div><dt>Logs</dt><dd>{{ agent.log_count }}</dd></div>
+                </dl>
+                {% if agent.active_claim %}
+                  <div class="agent-note live">
+                    <span>Claim</span>
+                    <p>{{ agent.active_claim.description }}</p>
+                  </div>
+                {% elif agent.stale_claim %}
+                  <div class="agent-note stale">
+                    <span>Stale claim</span>
+                    <p>{{ agent.stale_claim.description }}</p>
+                  </div>
+                {% elif agent.latest_run %}
+                  <div class="agent-note">
+                    <span>Latest run</span>
+                    <p>{{ agent.latest_run.description }}</p>
+                  </div>
+                {% endif %}
+              </article>
+            {% else %}
+              <p class="empty-note">Agent manifests will appear here if `shared/agents/` is populated.</p>
+            {% endfor %}
+          </div>
+        </article>
+      </section>
+
+      <section class="panel experiments-panel">
+        <div class="section-heading">
+          <div>
+            <span class="eyebrow">Experiment log</span>
+            <h3>Recent runs</h3>
+          </div>
+          <div class="section-actions">
+            <span class="chip">sorted by validation errors</span>
+            <span class="chip">last {{ state.experiments|length }} records</span>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Run</th>
+                <th>Status</th>
+                <th>Role</th>
+                <th>Family</th>
+                <th>Errors</th>
+                <th>Loss</th>
+                <th>Time</th>
+                <th>Recorded</th>
+                <th>Links</th>
+              </tr>
+            </thead>
+            <tbody id="experiments-table">
+              {% for row in state.experiments %}
+                <tr>
+                  <td>
+                    <div class="stacked-cell">
+                      <strong>{{ row.experiment_key }}</strong>
+                      <span>{{ row.description }}</span>
+                    </div>
+                  </td>
+                  <td><span class="pill {{ row.status }}">{{ row.status }}</span></td>
+                  <td>{{ row.role }}</td>
+                  <td>{{ row.model_family }}</td>
+                  <td>{{ row.val_errors }}</td>
+                  <td>{{ row.val_loss }}</td>
+                  <td>{{ row.training_seconds }}</td>
+                  <td>{{ row.recorded_label }}</td>
+                  <td>
+                    <div class="row-links">
+                      <a href="{{ row.record_path }}" target="_blank" rel="noreferrer">record</a>
+                      {% if row.snapshot_path %}<a href="{{ row.snapshot_path }}" target="_blank" rel="noreferrer">snapshot</a>{% endif %}
+                      {% if row.artifact_path %}<a href="{{ row.artifact_path }}" target="_blank" rel="noreferrer">artifacts</a>{% endif %}
+                    </div>
+                  </td>
+                </tr>
+              {% else %}
+                <tr>
+                  <td colspan="9">
+                    <div class="empty-state">
+                      <strong>No experiments logged yet.</strong>
+                      <span>Once an agent publishes a result, this table will populate with the latest runs and links to their records and artifacts.</span>
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="claims-grid">
+        <article class="panel claims-panel">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">Claims</span>
+              <h3>Active and stale claims</h3>
+            </div>
+          </div>
+          <div class="claim-columns">
+            <div>
+              <h4>Active</h4>
+              <ul class="claim-list" id="active-claims">
+                {% for claim in state.active_claims %}
+                  <li>
+                    <strong>{{ claim.role or claim.agent_id }}</strong>
+                    <span>{{ claim.description }}</span>
+                  </li>
+                {% else %}
+                  <li class="empty-note">No active claims.</li>
+                {% endfor %}
+              </ul>
+            </div>
+            <div>
+              <h4>Stale</h4>
+              <ul class="claim-list muted" id="stale-claims">
+                {% for claim in state.stale_claims %}
+                  <li>
+                    <strong>{{ claim.role or claim.agent_id }}</strong>
+                    <span>{{ claim.description }}</span>
+                  </li>
+                {% else %}
+                  <li class="empty-note">No stale claims.</li>
+                {% endfor %}
+              </ul>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel source-panel">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">Sources</span>
+              <h3>Shared state files</h3>
+            </div>
+          </div>
+          <dl class="source-list">
+            <div>
+              <dt>best_results.json</dt>
+              <dd><a href="{{ state.summary.links.best_results }}" target="_blank" rel="noreferrer">open</a></dd>
+            </div>
+            <div>
+              <dt>experiment_log.jsonl</dt>
+              <dd><a href="{{ state.summary.links.experiment_log }}" target="_blank" rel="noreferrer">open</a></dd>
+            </div>
+            <div>
+              <dt>claims/</dt>
+              <dd><a href="{{ state.summary.links.claims }}" target="_blank" rel="noreferrer">browse</a></dd>
+            </div>
+            <div>
+              <dt>locks/gpu.lock</dt>
+              <dd><a href="{{ state.summary.links.locks }}" target="_blank" rel="noreferrer">browse</a></dd>
+            </div>
+            <div>
+              <dt>agents/</dt>
+              <dd><a href="{{ state.summary.links.agents }}" target="_blank" rel="noreferrer">browse</a></dd>
+            </div>
+            <div>
+              <dt>accounts/</dt>
+              <dd><a href="{{ state.summary.links.accounts }}" target="_blank" rel="noreferrer">browse</a></dd>
+            </div>
+            <div>
+              <dt>accounts/health.json</dt>
+              <dd><a href="{{ state.summary.links.account_health }}" target="_blank" rel="noreferrer">open</a></dd>
+            </div>
+            <div>
+              <dt>accounts/leases/</dt>
+              <dd><a href="{{ state.summary.links.account_leases }}" target="_blank" rel="noreferrer">browse</a></dd>
+            </div>
+            <div>
+              <dt>accounts/events.jsonl</dt>
+              <dd><a href="{{ state.summary.links.account_events }}" target="_blank" rel="noreferrer">open</a></dd>
+            </div>
+            <div>
+              <dt>runtime/</dt>
+              <dd><a href="{{ state.summary.links.runtime }}" target="_blank" rel="noreferrer">browse</a></dd>
+            </div>
+            <div>
+              <dt>runtime/runpod-supervisor.json</dt>
+              <dd><a href="{{ state.summary.links.runpod_supervisor }}" target="_blank" rel="noreferrer">open</a></dd>
+            </div>
+            <div>
+              <dt>runtime/runpod-processes.json</dt>
+              <dd><a href="{{ state.summary.links.runpod_processes }}" target="_blank" rel="noreferrer">open</a></dd>
+            </div>
+            <div>
+              <dt>runtime/runpod-events.jsonl</dt>
+              <dd><a href="{{ state.summary.links.runpod_events }}" target="_blank" rel="noreferrer">open</a></dd>
+            </div>
+          </dl>
+        </article>
+      </section>
+    </main>
+
+    <script>
+      const initialState = {{ state | tojson }};
+      const refreshIntervalMs = 10000;
+
+      const state = {
+        summary: initialState.summary,
+        leaderboard: initialState.leaderboard,
+        experiments: initialState.experiments,
+        agents: initialState.agents,
+        chart: initialState.chart,
+        auth: initialState.auth,
+        runpod: initialState.runpod,
+        active_claims: initialState.active_claims,
+        stale_claims: initialState.stale_claims,
+      };
+
+      const chartColors = {
+        errors: "#0f766e",
+        loss: "#2563eb",
+        grid: "rgba(15, 23, 42, 0.08)",
+        text: "#64748b",
+      };
+
+      let errorsChart = null;
+      let lossChart = null;
+
+      function fmt(value, digits = 4) {
+        if (value === null || value === undefined || value === "") return "—";
+        const num = Number(value);
+        if (Number.isNaN(num)) return String(value);
+        return num.toFixed(digits).replace(/\.?0+$/, "");
+      }
+
+      function fmtInt(value) {
+        if (value === null || value === undefined || value === "") return "—";
+        const num = Number(value);
+        if (Number.isNaN(num)) return String(value);
+        return num.toLocaleString();
+      }
+
+      function fmtDate(value) {
+        if (!value) return "—";
+        const dt = new Date(value);
+        if (Number.isNaN(dt.getTime())) return String(value);
+        return dt.toLocaleString([], { dateStyle: "short", timeStyle: "short" });
+      }
+
+      function setText(id, value) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = value;
+      }
+
+      function renderSummary(summary) {
+        const gpuPill = document.getElementById("gpu-pill");
+        setText("updated-at", fmtDate(summary.generated_at));
+        setText("count-experiments", fmtInt(summary.counts.experiments));
+        setText("count-keeps", fmtInt(summary.counts.keeps));
+        setText("count-discards", fmtInt(summary.counts.discards));
+        setText("count-crashes", fmtInt(summary.counts.crashes));
+        setText("count-claims", fmtInt(summary.counts.active_claims));
+        setText("count-stale", fmtInt(summary.counts.stale_claims));
+        setText("auth-count-accounts", fmtInt(summary.counts.accounts));
+        setText("auth-count-healthy", fmtInt(summary.counts.auth_healthy));
+        setText("auth-count-leased", fmtInt(summary.counts.auth_leased));
+        setText("auth-count-suspect", fmtInt(summary.counts.auth_suspect));
+        setText("auth-count-free", fmtInt(summary.counts.auth_capacity_free));
+        setText("auth-count-waiting", fmtInt(summary.counts.auth_waiting));
+        setText("auth-summary-free", `${fmtInt(summary.counts.auth_capacity_free)} free slots`);
+        setText("auth-capacity-total", fmtInt(summary.counts.auth_capacity_total));
+        setText("auth-capacity-free", fmtInt(summary.counts.auth_capacity_free));
+        setText("auth-waiting-agents", fmtInt(summary.counts.auth_waiting));
+        setText("auth-suspect-count", fmtInt(summary.counts.auth_suspect));
+        setText("gpu-holder", summary.gpu_lock.agent_id || "—");
+        setText("gpu-role", summary.gpu_lock.role || "—");
+        setText("gpu-acquired", summary.gpu_lock.acquired_at ? fmtDate(summary.gpu_lock.acquired_at) : "—");
+        setText("gpu-age", summary.gpu_lock.age_seconds === null || summary.gpu_lock.age_seconds === undefined ? "—" : `${Math.round(summary.gpu_lock.age_seconds)}s`);
+        setText("metric-val-errors", summary.global_best_error === null || summary.global_best_error === undefined ? "—" : fmt(summary.global_best_error, 4));
+        setText("metric-val-loss", summary.global_best_loss === null || summary.global_best_loss === undefined ? "—" : fmt(summary.global_best_loss, 5));
+        setText("metric-test-errors", summary.global_best_test_errors === null || summary.global_best_test_errors === undefined ? "—" : fmt(summary.global_best_test_errors, 0));
+        setText("metric-test-accuracy", summary.global_best_test_accuracy === null || summary.global_best_test_accuracy === undefined ? "—" : fmt(summary.global_best_test_accuracy, 4));
+        if (gpuPill) {
+          const gpuState = summary.gpu_lock.locked ? (summary.gpu_lock.stale ? "warn" : "good") : "idle";
+          gpuPill.textContent = summary.gpu_lock.locked ? (summary.gpu_lock.stale ? "stale" : "locked") : "free";
+          gpuPill.className = `pill ${gpuState}`;
+        }
+      }
+
+      function renderRunpod(runpod) {
+        const summary = runpod?.summary || {};
+        const processes = runpod?.processes || [];
+        const alerts = summary.alerts || [];
+        const pill = document.getElementById("runpod-state-pill");
+        const alertsBody = document.getElementById("runpod-alert-list");
+        const processesBody = document.getElementById("runpod-processes-table");
+
+        setText("runpod-pod-id", summary.pod_id || "—");
+        setText("runpod-ssh-endpoint", summary.ssh_endpoint || "—");
+        setText("runpod-services-running", fmtInt(summary.services_running));
+        setText("runpod-uptime", summary.uptime_seconds === null || summary.uptime_seconds === undefined ? "—" : `${Math.round(Number(summary.uptime_seconds) || 0)}s`);
+        setText("runpod-workspace", summary.workspace_dir || "—");
+        setText("runpod-app-dir", summary.app_dir || "—");
+        setText("runpod-dashboard-port", summary.dashboard_port || "—");
+        setText("runpod-ssh-port", summary.ssh_port || "—");
+        setText("runpod-services-restarting", fmtInt(summary.services_restarting));
+        setText("runpod-services-exited", fmtInt(summary.services_exited));
+
+        if (pill) {
+          pill.textContent = summary.state || "unknown";
+          pill.className = pillClass(summary.loaded ? (summary.state || "idle") : "idle");
+        }
+
+        if (alertsBody) {
+          alertsBody.innerHTML = alerts.length
+            ? alerts.map((alert) => `
+              <li class="alert-item ${alert.level || "info"}">
+                <strong>${alert.title || "Alert"}</strong>
+                <span>${alert.message || "—"}</span>
+              </li>
+            `).join("")
+            : `<li class="empty-note">No RunPod alerts right now.</li>`;
+        }
+
+        if (processesBody) {
+          processesBody.innerHTML = processes.length
+            ? processes.map((process) => `
+              <tr>
+                <td>${process.name || "—"}</td>
+                <td>${process.kind || "—"}</td>
+                <td><span class="${pillClass(process.state)}">${process.state || "—"}</span></td>
+                <td>${process.pid || "—"}</td>
+                <td>${fmtInt(process.restart_count)}</td>
+                <td>${process.started_at ? fmtDate(process.started_at) : "—"}</td>
+                <td>${process.last_exit_at ? fmtDate(process.last_exit_at) : "—"}</td>
+              </tr>
+            `).join("")
+            : `<tr><td colspan="7"><div class="empty-state"><strong>No supervisor process data yet.</strong><span>Once the RunPod supervisor starts, its managed services will appear here.</span></div></td></tr>`;
+        }
+      }
+
+      function pillClass(status) {
+        if (!status) return "pill idle";
+        if (status === "keep" || status === "working" || status === "idle" || status === "healthy" || status === "leased") return "pill good";
+        if (status === "waiting" || status === "crash" || status === "crashed" || status === "stale" || status === "stale-claim" || status === "warn" || status === "suspect" || status === "expired" || status === "disabled") return "pill warn";
+        return `pill ${status}`;
+      }
+
+      function renderLeaderboard(leaderboard) {
+        const roleBody = document.getElementById("role-leaderboard");
+        const familyBody = document.getElementById("family-leaderboard");
+        if (roleBody) {
+          roleBody.innerHTML = leaderboard.by_role.length
+            ? leaderboard.by_role.map((row) => `
+              <tr>
+                <td>${row.role || "—"}</td>
+                <td>${fmtInt(row.val_errors)}</td>
+                <td>${fmt(row.val_loss, 5)}</td>
+                <td>${row.model_family || "—"}</td>
+              </tr>
+            `).join("")
+            : `<tr><td colspan="4" class="muted-row">No role winners yet.</td></tr>`;
+        }
+        if (familyBody) {
+          familyBody.innerHTML = leaderboard.by_family.length
+            ? leaderboard.by_family.map((row) => `
+              <tr>
+                <td>${row.family || "—"}</td>
+                <td>${fmtInt(row.val_errors)}</td>
+                <td>${fmt(row.val_loss, 5)}</td>
+                <td>${row.role || "—"}</td>
+              </tr>
+            `).join("")
+            : `<tr><td colspan="4" class="muted-row">No family winners yet.</td></tr>`;
+        }
+      }
+
+      function renderExperiments(experiments) {
+        const tbody = document.getElementById("experiments-table");
+        if (!tbody) return;
+        if (!experiments.length) {
+          tbody.innerHTML = `
+            <tr>
+              <td colspan="9">
+                <div class="empty-state">
+                  <strong>No experiments logged yet.</strong>
+                  <span>Once an agent publishes a result, this table will populate with the latest runs and links to their records and artifacts.</span>
+                </div>
+              </td>
+            </tr>
+          `;
+          return;
+        }
+        tbody.innerHTML = experiments.map((row) => `
+          <tr>
+            <td>
+              <div class="stacked-cell">
+                <strong>${row.experiment_key || "—"}</strong>
+                <span>${row.description || "—"}</span>
+              </div>
+            </td>
+            <td><span class="${pillClass(row.status)}">${row.status || "—"}</span></td>
+            <td>${row.role || "—"}</td>
+            <td>${row.model_family || "—"}</td>
+            <td>${fmtInt(row.val_errors)}</td>
+            <td>${fmt(row.val_loss, 5)}</td>
+            <td>${fmt(row.training_seconds, 0)}</td>
+            <td>${row.recorded_label || fmtDate(row.recorded_at)}</td>
+            <td>
+              <div class="row-links">
+                ${row.record_path ? `<a href="${row.record_path}" target="_blank" rel="noreferrer">record</a>` : ""}
+                ${row.snapshot_path ? `<a href="${row.snapshot_path}" target="_blank" rel="noreferrer">snapshot</a>` : ""}
+                ${row.artifact_path ? `<a href="${row.artifact_path}" target="_blank" rel="noreferrer">artifacts</a>` : ""}
+              </div>
+            </td>
+          </tr>
+        `).join("");
+      }
+
+      function renderAgents(agents) {
+        const container = document.getElementById("agent-list");
+        if (!container) return;
+        if (!agents.length) {
+          container.innerHTML = `<p class="empty-note">Agent manifests will appear here if <code>shared/agents/</code> is populated.</p>`;
+          return;
+        }
+        container.innerHTML = agents.map((agent) => `
+          <article class="agent-card">
+            <div class="agent-head">
+              <div>
+                <strong>${agent.display_name || agent.agent_id || "—"}</strong>
+                <span>${agent.agent_id || "—"}</span>
+              </div>
+              <span class="${pillClass(agent.status)}">${agent.status || "—"}</span>
+            </div>
+            <dl class="agent-kv">
+              <div><dt>Role</dt><dd>${agent.role || "—"}</dd></div>
+              <div><dt>Family</dt><dd>${agent.model_family || "—"}</dd></div>
+              <div><dt>Run mode</dt><dd>${agent.run_mode || "—"}</dd></div>
+              <div><dt>Account</dt><dd>${agent.account_label || agent.account_id || "—"}</dd></div>
+              <div><dt>Auth</dt><dd>${agent.account_status || "—"}</dd></div>
+              <div><dt>Last seen</dt><dd>${agent.last_seen ? fmtDate(agent.last_seen) : "—"}</dd></div>
+              <div><dt>Logs</dt><dd>${fmtInt(agent.log_count)}</dd></div>
+            </dl>
+            ${agent.active_claim ? `
+              <div class="agent-note live">
+                <span>Claim</span>
+                <p>${agent.active_claim.description || "—"}</p>
+              </div>
+            ` : agent.stale_claim ? `
+              <div class="agent-note stale">
+                <span>Stale claim</span>
+                <p>${agent.stale_claim.description || "—"}</p>
+              </div>
+            ` : agent.latest_run ? `
+              <div class="agent-note">
+                <span>Latest run</span>
+                <p>${agent.latest_run.description || "—"}</p>
+              </div>
+            ` : ""}
+          </article>
+        `).join("");
+      }
+
+      function renderClaims(activeClaims, staleClaims) {
+        const active = document.getElementById("active-claims");
+        const stale = document.getElementById("stale-claims");
+        if (active) {
+          active.innerHTML = activeClaims.length
+            ? activeClaims.map((claim) => `
+              <li>
+                <strong>${claim.role || claim.agent_id || "—"}</strong>
+                <span>${claim.description || "—"}</span>
+              </li>
+            `).join("")
+            : `<li class="empty-note">No active claims.</li>`;
+        }
+        if (stale) {
+          stale.innerHTML = staleClaims.length
+            ? staleClaims.map((claim) => `
+              <li>
+                <strong>${claim.role || claim.agent_id || "—"}</strong>
+                <span>${claim.description || "—"}</span>
+              </li>
+            `).join("")
+            : `<li class="empty-note">No stale claims.</li>`;
+        }
+      }
+
+      function renderAuth(auth) {
+        const accountsBody = document.getElementById("accounts-table");
+        const leasesBody = document.getElementById("leases-table");
+        const mapBody = document.getElementById("agent-account-map");
+        const alertsBody = document.getElementById("auth-alert-list");
+        const eventsBody = document.getElementById("auth-event-feed");
+
+        setText("auth-count-accounts", fmtInt(auth.summary?.counts?.accounts));
+        setText("auth-count-healthy", fmtInt(auth.summary?.counts?.healthy));
+        setText("auth-count-leased", fmtInt(auth.summary?.counts?.leased));
+        setText("auth-count-suspect", fmtInt(auth.summary?.counts?.suspect));
+        setText("auth-count-free", fmtInt(auth.summary?.counts?.capacity_free));
+        setText("auth-count-waiting", fmtInt(auth.summary?.counts?.waiting_agents));
+        setText("auth-summary-free", `${fmtInt(auth.summary?.counts?.capacity_free)} free slots`);
+        setText("auth-capacity-total", fmtInt(auth.summary?.counts?.capacity_total));
+        setText("auth-capacity-free", fmtInt(auth.summary?.counts?.capacity_free));
+        setText("auth-waiting-agents", fmtInt(auth.summary?.counts?.waiting_agents));
+        setText("auth-suspect-count", fmtInt(auth.summary?.counts?.suspect));
+
+        if (alertsBody) {
+          alertsBody.innerHTML = (auth.summary?.alerts || []).length
+            ? (auth.summary.alerts || []).map((alert) => `
+              <li class="alert-item ${alert.level || "info"}">
+                <strong>${alert.title || "Alert"}</strong>
+                <span>${alert.message || "—"}</span>
+              </li>
+            `).join("")
+            : `<li class="empty-note">No auth alerts right now.</li>`;
+        }
+
+        if (eventsBody) {
+          eventsBody.innerHTML = (auth.events || []).length
+            ? (auth.events || []).slice(0, 8).map((event) => `
+              <li>
+                <strong>${event.account_id || event.agent_id || event.role || event.kind || "—"}</strong>
+                <span>${event.message || event.event || event.kind || "—"}</span>
+                <small>${event.recorded_label || "—"}</small>
+              </li>
+            `).join("")
+            : `<li class="empty-note">No auth events yet.</li>`;
+        }
+
+        if (accountsBody) {
+          accountsBody.innerHTML = (auth.accounts || []).length
+            ? (auth.accounts || []).map((account) => `
+              <tr>
+                <td>
+                  <div class="stacked-cell">
+                    <strong>${account.label || account.account_id || "—"}</strong>
+                    <span>${account.account_id || "—"}</span>
+                  </div>
+                </td>
+                <td><span class="${pillClass(account.status)}">${account.status || "—"}</span></td>
+                <td>${fmtInt(account.capacity)}</td>
+                <td>${fmtInt(account.used_capacity)}</td>
+                <td>${fmtInt(account.free_capacity)}</td>
+                <td>
+                  <div class="stacked-cell">
+                    <strong>${fmtInt(account.active_lease_count)}</strong>
+                    <span>${(account.agents || []).length ? `${account.agents.length} mapped` : "—"}</span>
+                  </div>
+                </td>
+                <td>${account.last_verified_at || account.expires_at || "—"}</td>
+              </tr>
+            `).join("")
+            : `<tr><td colspan="7"><div class="empty-state"><strong>No account inventory yet.</strong><span>Add <code>shared/accounts/health.json</code> or lease files and the pool summary will appear here.</span></div></td></tr>`;
+        }
+
+        if (leasesBody) {
+          leasesBody.innerHTML = (auth.leases || []).length
+            ? (auth.leases || []).map((lease) => `
+              <tr>
+                <td>
+                  <div class="stacked-cell">
+                    <strong>${lease.lease_id || "—"}</strong>
+                    <span>${lease.path || "—"}</span>
+                  </div>
+                </td>
+                <td>${lease.account_label || lease.account_id || "—"}</td>
+                <td>${lease.agent_id || "—"}</td>
+                <td>${lease.role || "—"}</td>
+                <td><span class="${pillClass(lease.status)}">${lease.status || "—"}</span></td>
+                <td>${lease.expires_at || "—"}</td>
+                <td>${lease.heartbeat_at || "—"}</td>
+                <td>${fmtInt(lease.capacity)}</td>
+              </tr>
+            `).join("")
+            : `<tr><td colspan="8"><div class="empty-state"><strong>No leases recorded yet.</strong><span>Lease files in <code>shared/accounts/leases/</code> will appear here, including account-to-agent mapping.</span></div></td></tr>`;
+        }
+
+        if (mapBody) {
+          mapBody.innerHTML = (auth.agent_map || []).length
+            ? (auth.agent_map || []).map((item) => `
+              <tr>
+                <td>${item.agent_id || "—"}</td>
+                <td>${item.role || "—"}</td>
+                <td>${item.account_label || item.account_id || "—"}</td>
+                <td><span class="${pillClass(item.status)}">${item.status || "—"}</span></td>
+              </tr>
+            `).join("")
+            : `<tr><td colspan="4" class="muted-row">No agent/account mapping yet.</td></tr>`;
+        }
+      }
+
+      function renderChart(chartData) {
+        const errorsCtx = document.getElementById("errors-chart");
+        const lossCtx = document.getElementById("loss-chart");
+        if (!errorsCtx || !lossCtx) return;
+
+        const commonOptions = {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: "index", intersect: false },
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              backgroundColor: "rgba(15, 23, 42, 0.96)",
+              titleColor: "#e2e8f0",
+              bodyColor: "#e2e8f0",
+              borderColor: "rgba(148, 163, 184, 0.2)",
+              borderWidth: 1,
+            },
+          },
+          scales: {
+            x: {
+              grid: { color: chartColors.grid },
+              ticks: { color: chartColors.text, maxRotation: 0, autoSkip: true },
+            },
+            y: {
+              grid: { color: chartColors.grid },
+              ticks: { color: chartColors.text },
+            },
+          },
+        };
+
+        const baseDataset = {
+          fill: true,
+          borderWidth: 2,
+          tension: 0.36,
+          pointRadius: 0,
+        };
+
+        if (!errorsChart) {
+          errorsChart = new Chart(errorsCtx, {
+            type: "line",
+            data: {
+              labels: chartData.labels,
+              datasets: [{
+                ...baseDataset,
+                label: "Best val_errors",
+                data: chartData.best_val_errors,
+                borderColor: chartColors.errors,
+                backgroundColor: "rgba(15, 118, 110, 0.08)",
+                pointBackgroundColor: chartColors.errors,
+              }],
+            },
+            options: commonOptions,
+          });
+        } else {
+          errorsChart.data.labels = chartData.labels;
+          errorsChart.data.datasets[0].data = chartData.best_val_errors;
+          errorsChart.update();
+        }
+
+        if (!lossChart) {
+          lossChart = new Chart(lossCtx, {
+            type: "line",
+            data: {
+              labels: chartData.labels,
+              datasets: [{
+                ...baseDataset,
+                label: "Best val_loss",
+                data: chartData.best_val_loss,
+                borderColor: chartColors.loss,
+                backgroundColor: "rgba(37, 99, 235, 0.08)",
+                pointBackgroundColor: chartColors.loss,
+              }],
+            },
+            options: commonOptions,
+          });
+        } else {
+          lossChart.data.labels = chartData.labels;
+          lossChart.data.datasets[0].data = chartData.best_val_loss;
+          lossChart.update();
+        }
+      }
+
+      async function refresh() {
+        try {
+          const [summary, leaderboard, experiments, agents, chart, accounts, leases, authHealth, runpod] = await Promise.all([
+            fetch("/api/summary").then((r) => r.json()),
+            fetch("/api/leaderboard").then((r) => r.json()),
+            fetch("/api/experiments").then((r) => r.json()),
+            fetch("/api/agents").then((r) => r.json()),
+            fetch("/api/charts/best").then((r) => r.json()),
+            fetch("/api/accounts").then((r) => r.json()),
+            fetch("/api/leases").then((r) => r.json()),
+            fetch("/api/health/auth").then((r) => r.json()),
+            fetch("/api/runpod").then((r) => r.json()),
+          ]);
+          state.summary = summary;
+          state.leaderboard = leaderboard;
+          state.experiments = experiments.experiments || [];
+          state.agents = agents.agents || [];
+          state.chart = chart;
+          state.active_claims = agents.active_claims || [];
+          state.stale_claims = agents.stale_claims || [];
+          state.auth = {
+            accounts: accounts.accounts || [],
+            leases: leases.leases || [],
+            events: accounts.events || [],
+            agent_map: leases.agent_map || [],
+            summary: authHealth.health || accounts.health || summary.auth_health || { counts: {}, alerts: [] },
+          };
+          state.runpod = runpod.runpod || { summary: { alerts: [] }, processes: [], events: [] };
+          renderSummary(summary);
+          renderLeaderboard(leaderboard);
+          renderExperiments(state.experiments);
+          renderAgents(state.agents);
+          renderClaims(state.active_claims, state.stale_claims);
+          renderAuth(state.auth);
+          renderRunpod(state.runpod);
+          renderChart(chart);
+          setText("updated-at", fmtDate(summary.generated_at));
+        } catch (error) {
+          console.error("Dashboard refresh failed", error);
+        }
+      }
+
+      renderSummary(state.summary);
+      renderLeaderboard(state.leaderboard);
+      renderExperiments(state.experiments);
+      renderAgents(state.agents);
+      renderClaims(state.active_claims || [], state.stale_claims || []);
+      renderAuth(state.auth || { accounts: [], leases: [], events: [], agent_map: [], summary: { counts: {}, alerts: [] } });
+      renderRunpod(state.runpod || { summary: { alerts: [] }, processes: [], events: [] });
+      renderChart(state.chart);
+      setInterval(refresh, refreshIntervalMs);
+      setTimeout(refresh, 1500);
+    </script>
+  </body>
+</html>
