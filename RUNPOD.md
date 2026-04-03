@@ -28,11 +28,22 @@ Push the repo to GitHub and let the GHCR workflow publish the image, or build ma
 
 ```bash
 docker build \
+  -f Dockerfile.base \
   --platform linux/amd64 \
   --build-arg VCS_REF="$(git rev-parse --short HEAD)" \
-  -t ghcr.io/YOUR_ORG/autoresearch-mnist:main .
-docker push ghcr.io/YOUR_ORG/autoresearch-mnist:main
+  -t ghcr.io/YOUR_ORG/autoresearch-mnist-base:master .
+docker push ghcr.io/YOUR_ORG/autoresearch-mnist-base:master
+
+docker build \
+  -f Dockerfile \
+  --platform linux/amd64 \
+  --build-arg BASE_IMAGE=ghcr.io/YOUR_ORG/autoresearch-mnist-base:master \
+  --build-arg VCS_REF="$(git rev-parse --short HEAD)" \
+  -t ghcr.io/YOUR_ORG/autoresearch-mnist:master .
+docker push ghcr.io/YOUR_ORG/autoresearch-mnist:master
 ```
+
+The heavy CUDA/PyTorch layers now live in the base image so the app image rebuild stays much faster.
 
 ### 2. Capture Codex auth locally
 
@@ -74,6 +85,9 @@ That file should end up at:
 - custom image pointing at your GHCR image
 
 Use [runpod/pod-template.json](/home/dark/Desktop/Projects/autoresearch/runpod/pod-template.json) as the baseline request body or as a console checklist.
+
+For normal iteration, keep the Pod on a branch tag such as `master`.
+Once a workflow finishes and you want a fully reproducible deployment, replace that tag with the published digest from GHCR.
 
 Recommended environment variables on the Pod:
 
@@ -177,3 +191,4 @@ If an agent home is missing or stale, the runtime will hydrate it again from the
 - The Pod is intentionally single-node and single-GPU.
 - RunPod is the primary deploy target; Compose is now only a compatibility path.
 - The supervisor will restart crashed agent processes with backoff according to `config/swarm.yaml`.
+- The image runs `tini` in subreaper mode to avoid zombie-process warnings under RunPod's container wrapper. If you still see old `tini` warnings, rebuild and republish the image so the Pod picks up the latest `Dockerfile`.

@@ -4,7 +4,7 @@ x-common-build: &common-build
   context: .
   dockerfile: Dockerfile
   args:
-    NODE_MAJOR: ${NODE_MAJOR:-22}
+    BASE_IMAGE: ${AUTORESEARCH_BASE_IMAGE_NAME:-autoresearch-mnist-base:cuda128}
 
 x-common-env: &common-env
   AUTORESEARCH_WORKSPACE_ROOT: /workspace

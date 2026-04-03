@@ -1,53 +1,9 @@
-FROM docker.io/nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
+ARG BASE_IMAGE=autoresearch-mnist-base:cuda128
+FROM ${BASE_IMAGE}
 
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-
-ARG DEBIAN_FRONTEND=noninteractive
-ARG NODE_MAJOR=22
 ARG VCS_REF=dev
 
-ENV PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    VIRTUAL_ENV=/opt/autoresearch-venv \
-    PATH="/opt/autoresearch-venv/bin:/root/.local/bin:/usr/local/bin:${PATH}" \
-    HOME=/root \
-    AUTORESEARCH_IMAGE_APP_DIR=/opt/autoresearch/app \
-    AUTORESEARCH_IMAGE_REVISION=${VCS_REF} \
-    RUNPOD_MODE=0 \
-    RUNPOD_WORKSPACE_DIR=/workspace \
-    RUNPOD_APP_DIR=/workspace/autoresearch
-
-RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
-        ca-certificates \
-        curl \
-        git \
-        gnupg \
-        openssh-server \
-        procps \
-        python3.10 \
-        python3.10-venv \
-        python3-pip \
-        rsync \
-        tini; \
-    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -; \
-    apt-get install -y --no-install-recommends nodejs; \
-    npm install -g @openai/codex; \
-    curl -LsSf https://astral.sh/uv/install.sh | sh; \
-    apt-get clean; \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /root/.npm
-
-WORKDIR /opt/autoresearch-build
-
-COPY pyproject.toml uv.lock README.md ./
-
-RUN set -eux; \
-    UV_PROJECT_ENVIRONMENT="$VIRTUAL_ENV" uv sync \
-      --frozen \
-      --no-dev \
-      --no-install-project; \
-    rm -rf /opt/autoresearch-build /root/.cache/uv
+ENV AUTORESEARCH_IMAGE_REVISION=${VCS_REF}
 
 WORKDIR /opt/autoresearch/app
 COPY . /opt/autoresearch/app
@@ -57,9 +13,7 @@ RUN set -eux; \
     chmod 755 /var/run/sshd; \
     chmod +x /opt/autoresearch/app/scripts/runpod_entrypoint.sh
 
-RUN python3.10 --version && node --version && npm --version && uv --version && codex --version
-
 EXPOSE 22 8080
 
-ENTRYPOINT ["/usr/bin/tini", "--", "/bin/bash", "/opt/autoresearch/app/scripts/runpod_entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini", "-s", "--", "/bin/bash", "/opt/autoresearch/app/scripts/runpod_entrypoint.sh"]
 CMD ["bash"]

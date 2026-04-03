@@ -1,6 +1,6 @@
 {
   "name": "autoresearch-mnist-swarm",
-  "imageName": "ghcr.io/REPLACE_ME/autoresearch-mnist:main",
+  "imageName": "ghcr.io/migarci2/autoresearch-mnist:master",
   "gpuCount": 1,
   "gpuTypeIds": [
     "NVIDIA GeForce RTX 3090"

@@ -1,0 +1,57 @@
+FROM docker.io/nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG NODE_MAJOR=22
+ARG VCS_REF=dev
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    VIRTUAL_ENV=/opt/autoresearch-venv \
+    PATH="/opt/autoresearch-venv/bin:/root/.local/bin:/usr/local/bin:${PATH}" \
+    HOME=/root \
+    TINI_SUBREAPER=1 \
+    AUTORESEARCH_IMAGE_APP_DIR=/opt/autoresearch/app \
+    AUTORESEARCH_IMAGE_REVISION=${VCS_REF} \
+    RUNPOD_MODE=0 \
+    RUNPOD_WORKSPACE_DIR=/workspace \
+    RUNPOD_APP_DIR=/workspace/autoresearch
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        gnupg \
+        openssh-server \
+        procps \
+        python3.10 \
+        python3.10-venv \
+        python3-pip \
+        rsync \
+        tini; \
+    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -; \
+    apt-get install -y --no-install-recommends nodejs; \
+    npm install -g @openai/codex; \
+    curl -LsSf https://astral.sh/uv/install.sh | sh; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /root/.npm
+
+WORKDIR /opt/autoresearch-build
+
+COPY pyproject.toml uv.lock README.md ./
+
+RUN set -eux; \
+    UV_PROJECT_ENVIRONMENT="$VIRTUAL_ENV" uv sync \
+      --frozen \
+      --no-dev \
+      --no-install-project; \
+    rm -rf /opt/autoresearch-build /root/.cache/uv
+
+RUN set -eux; \
+    mkdir -p /workspace /workspace/autoresearch /workspace/homes /workspace/shared /workspace/worktrees /workspace/swarm_logs /var/run/sshd; \
+    chmod 755 /var/run/sshd
+
+RUN python3.10 --version && node --version && npm --version && uv --version && codex --version

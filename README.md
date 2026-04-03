@@ -15,6 +15,7 @@ They can reason and edit in parallel, but only one training job holds the GPU le
 
 The primary target is **one RunPod Pod** with:
 - one custom image published to GHCR
+- one reusable base image published to GHCR for heavy CUDA/PyTorch layers
 - one network volume mounted at `/workspace`
 - one supervisor process managing `agent-a` to `agent-e` plus the dashboard
 - one encrypted Codex account vault synced from your local machine
@@ -147,8 +148,15 @@ python setup_hub.py up --no-compose
 
 The repo includes a GHCR publishing workflow at [.github/workflows/publish-image.yml](.github/workflows/publish-image.yml).
 
+It now publishes two images:
+- `ghcr.io/<owner>/autoresearch-mnist-base`
+- `ghcr.io/<owner>/autoresearch-mnist`
+
+The base image contains the heavy CUDA, Python, Node, Codex CLI and PyTorch dependency layers.
+The app image is intentionally thin and mostly copies repo code on top of that base.
+
 Published tags include:
-- `main`
+- branch name like `master` or `main`
 - short `sha`
 - release tags like `v1.2.3`
 
